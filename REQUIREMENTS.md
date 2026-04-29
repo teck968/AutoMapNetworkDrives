@@ -1,0 +1,149 @@
+# AutoMapNetworkDrives — Requirements
+
+## 1. Overview
+
+A PowerShell script that runs on a Windows 11 workgroup machine and automatically maps network drives for SMB shares discovered on the local subnet. Runs silently at user login and is also manually re-runnable from a console.
+
+## 2. Goals
+
+- Discover live SMB hosts on the local subnet without user-maintained host lists.
+- Map user shares from those hosts as Windows network drives.
+- Provide stable, predictable drive letters across runs for known shares.
+- Handle authentication once per host, then reuse stored credentials silently.
+- Keep the user's existing manual mappings and persistent mappings intact.
+
+## 3. Non-Goals
+
+- Domain / Active Directory environments (workgroup only).
+- Mapping shares from the local computer (already accessible locally).
+- Mapping admin shares (`C$`, `ADMIN$`, etc.) or system shares (`IPC$`, `print$`).
+- Cross-subnet / VLAN discovery.
+- A graphical user interface.
+- Automatic configuration sync across machines.
+
+## 4. Functional Requirements
+
+### 4.1 Execution Model
+
+- **FR-1.** Runs silently at user login (registered as a Task Scheduler job or startup-folder entry).
+- **FR-2.** Can be invoked manually from a PowerShell console; manual invocations produce human-readable progress output to the console.
+- **FR-3.** A single instance enforcement — concurrent runs (e.g. login + manual) must not corrupt state.
+
+### 4.2 Discovery
+
+- **FR-4.** Auto-detect the local subnet from the active network adapter's IPv4 address and prefix length.
+- **FR-5.** Scan the detected subnet by attempting a TCP connection to port 445 on each host IP, in parallel.
+  - **FR-5.1.** Default per-host probe timeout: **500 ms** (configurable).
+  - **FR-5.2.** Default parallelism: **64** concurrent probes (configurable).
+- **FR-6.** Exclude the local computer's own IP addresses from the scan and from any subsequent share enumeration.
+- **FR-7.** For each responsive host, attempt to resolve a hostname using the following chain, in order, stopping at the first success:
+  - **FR-7.1.** Unicast DNS reverse lookup (PTR record).
+  - **FR-7.2.** LLMNR (Link-Local Multicast Name Resolution).
+  - **FR-7.3.** mDNS (`.local` resolution — covers NAS appliances, macOS, and Linux hosts running Avahi).
+  - **FR-7.4.** NetBIOS Node Status query (legacy NetBIOS-over-TCP/IP hosts).
+
+  Implementation note: on Windows, `Resolve-DnsName` covers FR-7.1 through FR-7.3 in a single call; FR-7.4 is provided by `nbtstat -A` as a fallback.
+
+  - **FR-7.5.** If a hostname is resolved, mappings use the UNC path `\\HOSTNAME\Share`. The full resolved name is used as-is (e.g. `\\MyNAS.local\Share`); no suffix stripping.
+  - **FR-7.6.** If all resolution methods fail, fall back to `\\IP\Share` and write a warning to the log indicating that a stable name (static DNS / hosts file entry, or enabling mDNS/Avahi on the host) is recommended.
+- **FR-8.** For each responsive host, enumerate available SMB shares.
+  - **FR-8.1.** Enumeration must work against an authenticated session — i.e. after stored credentials from FR-12 have been applied to the host (typically by establishing an `IPC$` connection first), share enumeration must succeed.
+  - **FR-8.2.** Enumeration must work against modern Windows hosts (Windows 10/11 with default settings) and modern NAS appliances. Implementations relying solely on legacy mechanisms (e.g. `net view` over the SMB1 Computer Browser service / SRVSVC anonymous enumeration) are insufficient and must be supplemented or replaced. Candidates include: authenticated `net view` after `IPC$` mount, Win32 `WNetEnumResource` API via P/Invoke, `Get-CimInstance Win32_Share` over WSMan, or direct SRVSVC RPC over the authenticated SMB session.
+  - **FR-8.3.** If share enumeration fails for an authenticated host, log an error identifying the host and the underlying error code; do not abort the run — continue with other hosts.
+
+### 4.3 Share Filtering
+
+- **FR-9.** Map only user shares. Skip:
+  - The IPC share (`IPC$`)
+  - The print share (`print$`)
+  - Admin shares (`ADMIN$`, single-letter-plus-`$` shares such as `C$`–`Z$`)
+  - Any other share whose name ends in `$` (treated as hidden/admin by default)
+- **FR-10.** No allowlist/denylist required for v1; share filtering is rule-based as above.
+
+### 4.4 Credentials
+
+- **FR-11.** When the script encounters a host that requires authentication and no credentials are stored:
+  - **FR-11.1.** During a **manual** run, prompt the user for username and password and store the result in **Windows Credential Manager** keyed by host.
+  - **FR-11.2.** During a **login** run, skip the host and log that credentials are missing.
+- **FR-12.** When credentials are already stored in Credential Manager for a host, retrieve and use them silently.
+- **FR-13.** Credentials are never written to the config file or log files.
+
+### 4.5 Drive Letter Assignment
+
+- **FR-14.** Hybrid strategy:
+  - **FR-14.1.** If the config file specifies a preferred drive letter for a UNC path (`\\HOST\Share`), use that letter.
+  - **FR-14.2.** Otherwise, auto-assign the next available drive letter, scanning from `Z:` downward toward `D:` (skipping `A:`–`C:`).
+  - **FR-14.3.** When a new auto-assigned mapping is created, append the `\\HOST\Share → letter` pair to the config file so the same letter is used on subsequent runs ("auto-learn").
+- **FR-15.** Auto-assignment must skip any drive letter that:
+  - Is currently in use by a local drive (e.g. removable media, optical, virtual disk).
+  - Is currently in use by an existing network mapping.
+  - Is reserved by the config file for a different `\\HOST\Share` (even if that share is currently unreachable).
+
+### 4.6 Mapping Persistence
+
+- **FR-16.** Mappings created from explicit config entries are created with the `-Persistent` flag (Windows reconnects them at logon independently of the script).
+- **FR-17.** Mappings created from auto-discovered shares are created **session-only** (no `-Persistent`); they are recreated each run.
+
+### 4.7 Conflict Handling
+
+- **FR-18.** Same share on the same letter → no-op; do not disturb the existing mapping.
+- **FR-19.** Wanted drive letter currently holds a *different* network share → choose a different letter via the auto-assignment rules in FR-15; do not disconnect the existing mapping.
+- **FR-20.** Wanted drive letter is a *local drive* → choose a different letter via the auto-assignment rules in FR-15.
+- **FR-21.** Same share is already mapped under a different letter → leave the existing mapping in place; do not create a duplicate.
+- **FR-22.** A persistent mapping points to an unreachable host → leave it alone (respect the user's config and Windows' own behavior).
+- **FR-23.** An auto-discovered (session-only) mapping from a previous run points to a host that is no longer reachable → unmap it.
+
+### 4.8 Configuration
+
+- **FR-24.** Config file path: `%APPDATA%\AutoMapNetworkDrives\config.json`.
+- **FR-25.** Config file format: JSON.
+- **FR-26.** If the file does not exist on first run, the script creates it with default values.
+- **FR-27.** The config schema includes (at minimum):
+  - Drive letter preferences: array of `{ unc: "\\HOST\Share", letter: "Z" }` entries (auto-learned and user-editable).
+  - Scan timeout (ms), default 500.
+  - Scan parallelism, default 64.
+- **FR-28.** Drive letter preferences from the config are honored across runs; entries written by auto-learn are functionally identical to entries written by the user.
+
+### 4.9 Output & Logging
+
+- **FR-29.** Manual runs print progress lines to the console (subnet being scanned, hosts found, shares being mapped, conflicts skipped, errors).
+- **FR-30.** Login runs are silent (no console window shown to the user).
+- **FR-31.** All runs (manual and login) write to a log file at `%LOCALAPPDATA%\AutoMapNetworkDrives\logs\map.log`.
+- **FR-32.** Log rotation:
+  - Single rolling file (`map.log`).
+  - Rotate at **5 MB**; rename existing `map.log` to `map.log.1`, shift `.1` → `.2`, etc.
+  - Keep **3** backups (`map.log.1`, `map.log.2`, `map.log.3`); older files are deleted.
+- **FR-33.** Log entries include timestamp, severity (INFO / WARN / ERROR), and message. No credentials are ever logged.
+
+## 5. Non-Functional Requirements
+
+- **NFR-1.** **Platform**: Windows 11. PowerShell 7+ recommended (for `ForEach-Object -Parallel`); fall back gracefully if only Windows PowerShell 5.1 is available, or document 7+ as a hard requirement.
+- **NFR-2.** **Runtime**: zero external dependencies beyond what ships with Windows + PowerShell. No additional modules from the Gallery.
+- **NFR-3.** **Performance**: a full scan of a /24 subnet must complete in under 5 seconds with default settings on a typical LAN.
+- **NFR-4.** **Resilience**: a single unreachable / misbehaving host must not block the scan or the script's overall completion.
+- **NFR-5.** **Idempotency**: running the script repeatedly with no LAN changes must converge to the same state without churn (no unnecessary disconnect/reconnect cycles).
+- **NFR-6.** **Security**:
+  - Credentials stored only in Windows Credential Manager.
+  - No credentials written to disk in plain text.
+  - No credentials written to logs.
+
+## 6. Open / Deferred Items
+
+The following are intentionally out of scope for v1 and may be revisited:
+
+- Allowlist / denylist of hosts or share names.
+- Per-host credential overrides via config file.
+- Pruning of stale entries from Credential Manager when a host has been gone for a long time.
+- Notifications (toast / tray) on mapping changes or failures.
+- Mid-session re-scan (currently: only login + manual triggers).
+- Multi-subnet / explicit CIDR support.
+- Combining `net view` results with the TCP 445 probe.
+
+## 7. Glossary
+
+- **UNC path**: Universal Naming Convention path of the form `\\HOST\Share`.
+- **SMB**: Server Message Block — the Windows file-sharing protocol, default on TCP port 445.
+- **Workgroup**: Windows networking model with no central directory; each host authenticates clients independently.
+- **Persistent mapping**: a drive mapping that Windows recreates at user logon, independent of any script.
+- **Session-only mapping**: a drive mapping that exists only until the user logs off.
+- **Credential Manager**: built-in Windows credential vault (`cmdkey.exe`, `Get-StoredCredential`).

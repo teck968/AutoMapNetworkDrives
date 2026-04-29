@@ -1,0 +1,19 @@
+# Claude Code per-user state
+.claude/settings.local.json
+
+# Windows OS metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Local-only test output / scratch
+*.local.*
+*.log

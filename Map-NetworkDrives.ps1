@@ -95,7 +95,7 @@ function Get-DefaultConfig {
     [pscustomobject]@{
         schemaVersion = 1
         scan          = [pscustomobject]@{
-            timeoutMs   = 500
+            timeoutMs   = 2000
             parallelism = 64
         }
         mappings      = @()
@@ -111,7 +111,7 @@ function Read-Config {
     }
     try {
         $cfg = Get-Content -Path $Script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-        if (-not $cfg.scan)      { $cfg | Add-Member -NotePropertyName scan      -NotePropertyValue ([pscustomobject]@{ timeoutMs = 500; parallelism = 64 }) -Force }
+        if (-not $cfg.scan)      { $cfg | Add-Member -NotePropertyName scan      -NotePropertyValue ([pscustomobject]@{ timeoutMs = 2000; parallelism = 64 }) -Force }
         if (-not $cfg.mappings)  { $cfg | Add-Member -NotePropertyName mappings  -NotePropertyValue @() -Force }
         return $cfg
     } catch {
@@ -592,13 +592,32 @@ function Get-RemoteSharesViaWNet {
 # === Drive letter assignment (FR-14, FR-15) ===
 
 function Get-UsedDriveLetters {
-    # Returns letters currently in use by ANY drive (local or network).
+    # Returns letters currently in use by ANY drive (local, network, or remembered).
     $letters = New-Object System.Collections.Generic.HashSet[string]
     foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
         if ($d.Name.Length -eq 1) { [void]$letters.Add($d.Name.ToUpper()) }
     }
     foreach ($m in (Get-SmbMapping -ErrorAction SilentlyContinue)) {
         if ($m.LocalPath -match '^([A-Z]):') { [void]$letters.Add($matches[1]) }
+    }
+    # HKCU:\Network\<letter> stores remembered persistent network drive mappings,
+    # including ones whose target is currently unreachable. Get-SmbMapping does
+    # NOT reliably surface these — particularly when the share is offline — but
+    # they still occupy the drive letter and cause WNetAddConnection2 to fail
+    # with ERROR_ALREADY_ASSIGNED (Win32 85). Per FR-22 we leave the entry alone
+    # and just treat the letter as reserved.
+    if (Test-Path 'HKCU:\Network') {
+        foreach ($key in (Get-ChildItem 'HKCU:\Network' -ErrorAction SilentlyContinue)) {
+            if ($key.PSChildName -match '^[A-Za-z]$') {
+                [void]$letters.Add($key.PSChildName.ToUpper())
+            }
+        }
+    }
+    # In-run failures: if New-SmbMapping failed for a letter earlier in this run
+    # (e.g. the registry walk missed a binding the underlying API still sees),
+    # don't retry that letter for subsequent shares.
+    if ($Script:FailedLetters) {
+        foreach ($l in $Script:FailedLetters) { [void]$letters.Add($l) }
     }
     return $letters
 }
@@ -676,6 +695,12 @@ function New-MappedDrive {
         return $true
     } catch {
         Write-Log "Failed to map ${Letter}: -> $UNC : $($_.Exception.Message)" -Level ERROR
+        # Track the failure so subsequent shares don't keep trying the same letter.
+        # Get-UsedDriveLetters consults this set on each call.
+        if (-not $Script:FailedLetters) {
+            $Script:FailedLetters = New-Object System.Collections.Generic.HashSet[string]
+        }
+        [void]$Script:FailedLetters.Add($Letter.ToUpper())
         return $false
     }
 }
@@ -720,9 +745,26 @@ if (-not $mutex) {
     Write-Log "Another instance is already running; exiting." -Level WARN
     exit 0
 }
+function Test-IsElevated {
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object System.Security.Principal.WindowsPrincipal $id).IsInRole(
+        [System.Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
 $exitCode = 0
+$Script:FailedLetters = New-Object System.Collections.Generic.HashSet[string]
 try {
     Write-Log "AutoMapNetworkDrives starting (mode: $(if ($Script:Silent) {'silent'} else {'manual'}), dryRun: $Script:DryRun)"
+
+    # Warn on elevated execution: Windows UAC keeps drive mappings created in
+    # the elevated logon session separate from the user's interactive session,
+    # so mappings made here would not appear in the user's Explorer ("linked
+    # connections" / EnableLinkedConnections behavior). Strongly suggest
+    # re-running non-elevated unless the user has set EnableLinkedConnections.
+    if ((Test-IsElevated) -and -not $Script:Silent) {
+        Write-Log "Running ELEVATED - drive mappings created here will live in the admin logon session and will NOT appear in your normal Explorer." -Level WARN
+        Write-Log "  Re-run from a non-elevated PowerShell/cmd window unless you have set HKLM\SYSTEM\CurrentControlSet\Control\Lsa\EnableLinkedConnections=1." -Level WARN
+    }
 
     $config = Read-Config
     if ($TimeoutMs -gt 0)    { $config.scan.timeoutMs   = $TimeoutMs }

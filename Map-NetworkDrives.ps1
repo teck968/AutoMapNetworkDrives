@@ -246,20 +246,203 @@ function Get-ShortHostName {
     return ($ResolvedName -split '\.')[0]
 }
 
-# === Credentials (FR-11..FR-13) — stub, implemented in next commit ===
+# === Credential Manager I/O (FR-11.5, FR-12, FR-13, NFR-6) ===
 
-function Get-StoredCredential {
-    param([string]$Host)
-    # TODO: read from Windows Credential Manager
-    return $null
+# P/Invoke wrapper around advapi32 CredRead/CredWrite/CredDelete. Stores generic
+# credentials under the target name "AutoMapNetworkDrives:<host>". The Windows
+# Credential Manager handles DPAPI encryption at rest; passwords are kept in
+# managed strings only briefly while in process and never written to disk by us.
+if (-not ('AutoMapNetworkDrives.Cred' -as [type])) {
+    $credSrc = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace AutoMapNetworkDrives {
+    public static class Cred {
+        const int CRED_TYPE_GENERIC = 1;
+        const int CRED_PERSIST_LOCAL_MACHINE = 2;
+        const int ERROR_NOT_FOUND = 1168;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct CREDENTIAL {
+            public int Flags;
+            public int Type;
+            [MarshalAs(UnmanagedType.LPWStr)] public string TargetName;
+            [MarshalAs(UnmanagedType.LPWStr)] public string Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public int CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public int Persist;
+            public int AttributeCount;
+            public IntPtr Attributes;
+            [MarshalAs(UnmanagedType.LPWStr)] public string TargetAlias;
+            [MarshalAs(UnmanagedType.LPWStr)] public string UserName;
+        }
+
+        [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredRead(string target, int type, int flags, out IntPtr credPtr);
+        [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredWrite([In] ref CREDENTIAL userCredential, int flags);
+        [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredDelete(string target, int type, int flags);
+        [DllImport("advapi32.dll")]
+        private static extern void CredFree(IntPtr buffer);
+
+        public static bool TryRead(string target, out string user, out string secret) {
+            user = null; secret = null;
+            IntPtr p = IntPtr.Zero;
+            if (!CredRead(target, CRED_TYPE_GENERIC, 0, out p)) {
+                int err = Marshal.GetLastWin32Error();
+                if (err == ERROR_NOT_FOUND) return false;
+                throw new System.ComponentModel.Win32Exception(err);
+            }
+            try {
+                var c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
+                user = c.UserName;
+                int n = c.CredentialBlobSize;
+                if (n > 0 && c.CredentialBlob != IntPtr.Zero) {
+                    byte[] bytes = new byte[n];
+                    Marshal.Copy(c.CredentialBlob, bytes, 0, n);
+                    secret = Encoding.Unicode.GetString(bytes);
+                } else {
+                    secret = "";
+                }
+                return true;
+            } finally { CredFree(p); }
+        }
+
+        public static void Write(string target, string user, string secret) {
+            byte[] secretBytes = Encoding.Unicode.GetBytes(secret ?? "");
+            IntPtr blobPtr = Marshal.AllocCoTaskMem(secretBytes.Length);
+            try {
+                if (secretBytes.Length > 0) {
+                    Marshal.Copy(secretBytes, 0, blobPtr, secretBytes.Length);
+                }
+                var cred = new CREDENTIAL {
+                    Flags = 0,
+                    Type = CRED_TYPE_GENERIC,
+                    TargetName = target,
+                    Comment = null,
+                    CredentialBlobSize = secretBytes.Length,
+                    CredentialBlob = blobPtr,
+                    Persist = CRED_PERSIST_LOCAL_MACHINE,
+                    AttributeCount = 0,
+                    Attributes = IntPtr.Zero,
+                    TargetAlias = null,
+                    UserName = user
+                };
+                if (!CredWrite(ref cred, 0)) {
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                }
+            } finally { Marshal.FreeCoTaskMem(blobPtr); }
+        }
+
+        public static bool Delete(string target) {
+            if (CredDelete(target, CRED_TYPE_GENERIC, 0)) return true;
+            int err = Marshal.GetLastWin32Error();
+            if (err == ERROR_NOT_FOUND) return false;
+            throw new System.ComponentModel.Win32Exception(err);
+        }
+    }
+}
+"@
+    Add-Type -TypeDefinition $credSrc -ErrorAction Stop
 }
 
-# === Authenticated SMB session (FR-12.1) — stub ===
+function Get-CredTargetName {
+    param([Parameter(Mandatory)] [string]$HostName)
+    "$($Script:AppName):$HostName"
+}
+
+function Get-StoredCredential {
+    param([Parameter(Mandatory)] [string]$HostName)
+    $target = Get-CredTargetName -HostName $HostName
+    $user   = $null
+    $secret = $null
+    try {
+        $found = [AutoMapNetworkDrives.Cred]::TryRead($target, [ref]$user, [ref]$secret)
+    } catch {
+        Write-Log "Credential read failed for ${HostName}: $($_.Exception.Message)" -Level WARN
+        return $null
+    }
+    if (-not $found) { return $null }
+    $sec = ConvertTo-SecureString -String $secret -AsPlainText -Force
+    return [pscredential]::new($user, $sec)
+}
+
+function Save-StoredCredential {
+    param(
+        [Parameter(Mandatory)] [string]$HostName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+    if ($Script:DryRun) {
+        Write-Log "[dry-run] Would save credential for $HostName"
+        return
+    }
+    $target = Get-CredTargetName -HostName $HostName
+    $plain  = $Credential.GetNetworkCredential().Password
+    [AutoMapNetworkDrives.Cred]::Write($target, $Credential.UserName, $plain)
+    Write-Log "Stored credential in Credential Manager for $HostName"
+}
+
+# === Authenticated SMB session (FR-12.1) ===
+
+function Get-Win32ErrorMessage {
+    param([int]$Code)
+    try { (New-Object System.ComponentModel.Win32Exception($Code)).Message }
+    catch { "Win32 error $Code" }
+}
+
+function Test-AuthError {
+    param([int]$ErrorCode)
+    # Win32 codes that indicate authentication is the problem (vs. unreachable host etc.)
+    $authCodes = @(
+        5,    # ERROR_ACCESS_DENIED
+        86,   # ERROR_INVALID_PASSWORD
+        1326, # ERROR_LOGON_FAILURE
+        1327, # ERROR_ACCOUNT_RESTRICTION
+        1329, # ERROR_LOGON_TYPE_NOT_GRANTED
+        1907, # ERROR_PASSWORD_MUST_CHANGE
+        1909, # ERROR_ACCOUNT_LOCKED_OUT
+        1910  # ERROR_ACCOUNT_DISABLED
+    )
+    return $authCodes -contains $ErrorCode
+}
 
 function Connect-AuthenticatedSmbSession {
-    param([string]$Host, [pscredential]$Credential)
-    # TODO: net use \\HOST\IPC$ /user:NAME password
-    throw "Connect-AuthenticatedSmbSession not implemented yet"
+    param(
+        [Parameter(Mandatory)] [string]$HostName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+    # Mounts \\HOST\IPC$ via WNetAddConnection2 — same API File Explorer uses.
+    # Returns {Success, ErrorCode, Error}. No persistent flag (session-only).
+    $unc = "\\$HostName\IPC`$"
+    if ($Script:DryRun) {
+        return [pscustomobject]@{ Success = $true; ErrorCode = 0; Error = $null }
+    }
+
+    $user = $Credential.UserName
+    $pass = $Credential.GetNetworkCredential().Password
+    $rc   = [AutoMapNetworkDrives.WNet]::AddConnection($unc, $user, $pass, $false)
+
+    # 1219 = ERROR_SESSION_CREDENTIAL_CONFLICT (a different cred is already in
+    # use for this server). Tear down and retry once. We cancel only \\HOST\IPC$
+    # — not \\HOST\* — to avoid disturbing user-initiated mappings to the same
+    # server under different shares.
+    if ($rc -eq 1219) {
+        [void][AutoMapNetworkDrives.WNet]::CancelConnection($unc, $true)
+        $rc = [AutoMapNetworkDrives.WNet]::AddConnection($unc, $user, $pass, $false)
+    }
+
+    if ($rc -eq 0) {
+        return [pscustomobject]@{ Success = $true; ErrorCode = 0; Error = $null }
+    }
+    [pscustomobject]@{
+        Success   = $false
+        ErrorCode = $rc
+        Error     = (Get-Win32ErrorMessage -Code $rc)
+    }
 }
 
 # === Share enumeration (FR-8, WNetEnumResource per spike) ===
@@ -292,6 +475,25 @@ namespace AutoMapNetworkDrives {
         public static extern int WNetEnumResource(IntPtr hEnum, ref int lpcCount, IntPtr lpBuffer, ref int lpBufferSize);
         [DllImport("mpr.dll")]
         public static extern int WNetCloseEnum(IntPtr hEnum);
+        [DllImport("mpr.dll", CharSet = CharSet.Auto)]
+        public static extern int WNetAddConnection2(NETRESOURCE lpNetResource, string lpPassword, string lpUserName, int dwFlags);
+        [DllImport("mpr.dll", CharSet = CharSet.Auto)]
+        public static extern int WNetCancelConnection2(string lpName, int dwFlags, bool fForce);
+
+        public static int AddConnection(string remoteName, string user, string password, bool persistent) {
+            var nr = new NETRESOURCE {
+                dwScope = 1,    // RESOURCE_GLOBALNET
+                dwType = 1,     // RESOURCETYPE_DISK
+                dwUsage = 1,    // RESOURCEUSAGE_CONNECTABLE
+                lpRemoteName = remoteName
+            };
+            int flags = persistent ? 1 : 0; // CONNECT_UPDATE_PROFILE = 1
+            return WNetAddConnection2(nr, password, user, flags);
+        }
+
+        public static int CancelConnection(string name, bool force) {
+            return WNetCancelConnection2(name, 0, force);
+        }
 
         public static List<string[]> EnumShares(string remoteName) {
             var result = new List<string[]>();
@@ -517,6 +719,15 @@ try {
     $elapsed = (Get-Date) - $start
     Write-Log ("Probe complete: {0} live SMB host(s) in {1:N1}s" -f $liveIPs.Count, $elapsed.TotalSeconds)
 
+    # === Phase 1: discovery + enumeration with stored credentials (FR-11.1) ===
+    # For each live host: resolve hostname, try enum (works if pre-authed or if
+    # the host allows anonymous enum). On auth failure, retry with creds from
+    # Credential Manager (FR-12). Hosts still failing auth are deferred to
+    # Phase 2 in manual mode, or skipped in silent mode (FR-11.4).
+
+    $hostShares = New-Object 'System.Collections.Generic.Dictionary[string, object]'
+    $needsCreds = New-Object System.Collections.Generic.List[string]
+
     foreach ($ip in $liveIPs) {
         $resolved = Resolve-RemoteHostName -IP $ip
         $target   = if ($resolved) { $resolved } else { $ip }
@@ -525,23 +736,93 @@ try {
         }
         Write-Log "Host: $target ($ip)"
 
-        # TODO: credentials + auth session establishment (FR-11..FR-12.1).
-        # For now, rely on any pre-existing IPC$ session (e.g. from manual
-        # `net use \\HOST /user:NAME` already done by the user).
-
         $enumResult = Get-RemoteSharesViaWNet -ServerName $target
+
+        if (-not $enumResult.Success -and (Test-AuthError $enumResult.ErrorCode)) {
+            $stored = Get-StoredCredential -HostName $target
+            if ($stored) {
+                Write-Log "  Using stored credentials for $target"
+                $auth = Connect-AuthenticatedSmbSession -HostName $target -Credential $stored
+                if ($auth.Success) {
+                    $enumResult = Get-RemoteSharesViaWNet -ServerName $target
+                } else {
+                    Write-Log ("  Stored credentials rejected for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
+                }
+            }
+        }
+
         if (-not $enumResult.Success) {
-            Write-Log ("Host {0} - share enumeration failed (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+            if (Test-AuthError $enumResult.ErrorCode) {
+                if ($Script:Silent) {
+                    Write-Log "  Host $target requires credentials; skipping (silent mode, FR-11.4)" -Level WARN
+                } else {
+                    [void]$needsCreds.Add($target)
+                    Write-Log "  Host $target deferred to credential prompt phase"
+                }
+            } else {
+                Write-Log ("  Share enumeration failed for {0} (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+            }
             continue
         }
+
         if ($enumResult.Shares.Count -eq 0) {
-            Write-Log "Host $target - no user shares listed"
+            Write-Log "  No user shares listed on $target"
             continue
         }
+        $hostShares[$target] = $enumResult.Shares
+    }
+
+    # === Phase 2: batched credential prompt (FR-11.2) — manual mode only ===
+
+    if ($Script:DryRun -and -not $Script:Silent -and $needsCreds.Count -gt 0) {
+        Write-Log "[dry-run] $($needsCreds.Count) host(s) would be prompted for credentials:"
+        foreach ($h in $needsCreds) { Write-Log "  - $h" }
+    }
+    elseif (-not $Script:Silent -and -not $Script:DryRun -and $needsCreds.Count -gt 0) {
+        Write-Log "$($needsCreds.Count) host(s) require credentials:"
+        foreach ($h in $needsCreds) { Write-Log "  - $h" }
+
+        foreach ($target in $needsCreds) {
+            $cred = $null
+            try {
+                $cred = Get-Credential -Message "Credentials for \\$target"
+            } catch {
+                Write-Log "  Credential prompt failed for ${target}: $($_.Exception.Message)" -Level WARN
+                continue
+            }
+            if (-not $cred) {
+                Write-Log "  No credentials provided for $target; skipping" -Level WARN
+                continue
+            }
+
+            $auth = Connect-AuthenticatedSmbSession -HostName $target -Credential $cred
+            if (-not $auth.Success) {
+                Write-Log ("  Authentication failed for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
+                continue
+            }
+
+            Save-StoredCredential -HostName $target -Credential $cred
+
+            $enumResult = Get-RemoteSharesViaWNet -ServerName $target
+            if (-not $enumResult.Success) {
+                Write-Log ("  Enumeration still failing post-auth for {0} (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+                continue
+            }
+            if ($enumResult.Shares.Count -eq 0) {
+                Write-Log "  No user shares listed on $target"
+                continue
+            }
+            $hostShares[$target] = $enumResult.Shares
+        }
+    }
+
+    # === Phase 3: mapping (FR-11.3, FR-14..FR-21, FR-34..FR-37) ===
+
+    foreach ($target in @($hostShares.Keys)) {
         $shortHost = Get-ShortHostName -ResolvedName $target
         if (-not $shortHost) { $shortHost = $target }
 
-        foreach ($share in $enumResult.Shares) {
+        foreach ($share in $hostShares[$target]) {
             Write-Log ("  Share: {0}{1}" -f $share.UNC, $(if ($share.Comment) { " [$($share.Comment)]" } else { '' }))
 
             $assignment = Get-LetterForUnc -UNC $share.UNC -Config $config

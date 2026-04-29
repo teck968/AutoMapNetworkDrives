@@ -47,8 +47,9 @@ $Script:LogDir     = Join-Path $env:LOCALAPPDATA "$($Script:AppName)\logs"
 $Script:LogPath    = Join-Path $Script:LogDir 'map.log'
 $Script:LogMaxBytes = 5 * 1024 * 1024
 $Script:LogKeep     = 3
-$Script:Silent     = [bool]$Silent
-$Script:DryRun     = $false   # Set from -DryRun in Main
+# NOTE: do NOT initialize $Script:Silent or $Script:DryRun here — those are
+# the same variables as the param-block switches (params are script-scoped).
+# Reassigning them to $false would overwrite the user's command-line input.
 
 # === Logging (FR-29..FR-33) ===
 
@@ -364,25 +365,131 @@ function Get-RemoteSharesViaWNet {
     }
 }
 
-# === Drive letter assignment (FR-14, FR-15) — stub ===
+# === Drive letter assignment (FR-14, FR-15) ===
 
-function Get-FreeDriveLetter {
-    param([string[]]$Reserved)
-    # TODO: scan Z..D for first free letter
-    throw "Get-FreeDriveLetter not implemented yet"
+function Get-UsedDriveLetters {
+    # Returns letters currently in use by ANY drive (local or network).
+    $letters = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($d in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        if ($d.Name.Length -eq 1) { [void]$letters.Add($d.Name.ToUpper()) }
+    }
+    foreach ($m in (Get-SmbMapping -ErrorAction SilentlyContinue)) {
+        if ($m.LocalPath -match '^([A-Z]):') { [void]$letters.Add($matches[1]) }
+    }
+    return $letters
 }
 
-# === Mapping + label (FR-16, FR-17, FR-34..FR-38) — stub ===
+function Get-NextFreeDriveLetter {
+    param([string[]]$Reserved = @())
+    $used = Get-UsedDriveLetters
+    $reservedUpper = @($Reserved | ForEach-Object { $_.ToUpper() })
+    foreach ($code in 90..68) {  # Z..D
+        $letter = [char]$code
+        if ($used.Contains([string]$letter)) { continue }
+        if ($reservedUpper -contains [string]$letter) { continue }
+        return [string]$letter
+    }
+    return $null
+}
 
-function Set-NetworkDriveMapping {
-    param([string]$Letter, [string]$UNC, [bool]$Persistent, [string]$Label)
-    # TODO: New-SmbMapping + _LabelFromReg
-    throw "Set-NetworkDriveMapping not implemented yet"
+function Get-LetterForUnc {
+    param(
+        [Parameter(Mandatory)] [string]$UNC,
+        [Parameter(Mandatory)] $Config
+    )
+    $existing = $Config.mappings | Where-Object { $_.unc -eq $UNC } | Select-Object -First 1
+    if ($existing) {
+        return [pscustomobject]@{ Letter = $existing.letter.ToUpper(); FromConfig = $true; Persistent = [bool]$existing.persistent }
+    }
+    $reserved = @($Config.mappings | ForEach-Object { $_.letter })
+    $letter = Get-NextFreeDriveLetter -Reserved $reserved
+    if (-not $letter) { return $null }
+    return [pscustomobject]@{ Letter = $letter; FromConfig = $false; Persistent = $false }
+}
+
+# === Mapping + label (FR-16, FR-17, FR-34..FR-38) ===
+
+function Get-MountPointRegPath {
+    param([Parameter(Mandatory)] [string]$UNC)
+    # \\HOST\share -> HKCU:\...\MountPoints2\##HOST#share
+    $stripped = $UNC -replace '^\\\\', ''
+    $key = '##' + ($stripped -replace '\\', '#')
+    return "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\$key"
+}
+
+function Set-NetworkDriveLabel {
+    param(
+        [Parameter(Mandatory)] [string]$UNC,
+        [Parameter(Mandatory)] [string]$ShareName,
+        [Parameter(Mandatory)] [string]$ShortHostName
+    )
+    $label = "$ShareName on $ShortHostName"
+    if ($Script:DryRun) {
+        Write-Log "[dry-run] Would set label '$label' for $UNC"
+        return
+    }
+    $regPath = Get-MountPointRegPath -UNC $UNC
+    if (-not (Test-Path $regPath)) {
+        New-Item -Path $regPath -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    Set-ItemProperty -Path $regPath -Name '_LabelFromReg' -Value $label -Type String -Force -ErrorAction Stop
+    Write-Log "Set label '$label' for $UNC"
+}
+
+function New-MappedDrive {
+    param(
+        [Parameter(Mandatory)] [string]$Letter,
+        [Parameter(Mandatory)] [string]$UNC,
+        [Parameter(Mandatory)] [bool]$Persistent
+    )
+    if ($Script:DryRun) {
+        Write-Log "[dry-run] Would map ${Letter}: -> $UNC (persistent=$Persistent)"
+        return $true
+    }
+    try {
+        New-SmbMapping -LocalPath "${Letter}:" -RemotePath $UNC -Persistent:$Persistent -ErrorAction Stop | Out-Null
+        Write-Log "Mapped ${Letter}: -> $UNC (persistent=$Persistent)"
+        return $true
+    } catch {
+        Write-Log "Failed to map ${Letter}: -> $UNC : $($_.Exception.Message)" -Level ERROR
+        return $false
+    }
+}
+
+function Test-MappingConflict {
+    param(
+        [Parameter(Mandatory)] [string]$Letter,
+        [Parameter(Mandatory)] [string]$UNC
+    )
+    # Returns one of: 'NoOp' | 'Free' | 'LetterTaken' | 'AlreadyElsewhere'
+    $byLetter = Get-SmbMapping -LocalPath "${Letter}:" -ErrorAction SilentlyContinue
+    if ($byLetter -and $byLetter.RemotePath -ieq $UNC) { return 'NoOp' }
+    if ($byLetter) { return 'LetterTaken' }
+    $byUnc = Get-SmbMapping -RemotePath $UNC -ErrorAction SilentlyContinue
+    if ($byUnc) { return 'AlreadyElsewhere' }
+    $used = Get-UsedDriveLetters
+    if ($used.Contains([string]$Letter.ToUpper())) { return 'LetterTaken' }
+    return 'Free'
+}
+
+function Add-ConfigMapping {
+    param(
+        [Parameter(Mandatory)] $Config,
+        [Parameter(Mandatory)] [string]$UNC,
+        [Parameter(Mandatory)] [string]$Letter,
+        [Parameter(Mandatory)] [bool]$Persistent
+    )
+    $entry = [pscustomobject]@{ unc = $UNC; letter = $Letter; persistent = $Persistent }
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($Config.mappings) { foreach ($m in $Config.mappings) { [void]$list.Add($m) } }
+    [void]$list.Add($entry)
+    $Config.mappings = $list.ToArray()
 }
 
 # === Main ===
 
-$Script:DryRun = [bool]$DryRun
+# $DryRun and $Silent are already script-scoped via the param block; functions
+# can read them directly (or via $Script:DryRun / $Script:Silent — same thing).
 
 $mutex = New-SingleInstanceMutex
 if (-not $mutex) {
@@ -431,9 +538,59 @@ try {
             Write-Log "Host $target - no user shares listed"
             continue
         }
+        $shortHost = Get-ShortHostName -ResolvedName $target
+        if (-not $shortHost) { $shortHost = $target }
+
         foreach ($share in $enumResult.Shares) {
             Write-Log ("  Share: {0}{1}" -f $share.UNC, $(if ($share.Comment) { " [$($share.Comment)]" } else { '' }))
-            # TODO (next commits): drive letter assignment + mapping + label
+
+            $assignment = Get-LetterForUnc -UNC $share.UNC -Config $config
+            if (-not $assignment) {
+                Write-Log "    No drive letters available; skipping $($share.UNC)" -Level WARN
+                continue
+            }
+            $letter = $assignment.Letter
+
+            # NOTE: `continue` inside `switch` exits the switch, not the foreach.
+            # Use a $skipShare flag to short-circuit out of this iteration after
+            # a no-map decision (NoOp / AlreadyElsewhere / no-letter-available).
+            $skipShare = $false
+            $conflict = Test-MappingConflict -Letter $letter -UNC $share.UNC
+            switch ($conflict) {
+                'NoOp' {
+                    Write-Log "    ${letter}: already mapped to $($share.UNC); no-op (FR-18)"
+                    Set-NetworkDriveLabel -UNC $share.UNC -ShareName $share.Name -ShortHostName $shortHost
+                    $skipShare = $true
+                }
+                'AlreadyElsewhere' {
+                    Write-Log "    $($share.UNC) already mapped under a different letter; leaving as-is (FR-21)"
+                    $skipShare = $true
+                }
+                'LetterTaken' {
+                    if ($assignment.FromConfig) {
+                        Write-Log "    Configured letter ${letter}: is taken; trying next free letter (FR-19/20)" -Level WARN
+                    }
+                    $reserved = @($config.mappings | ForEach-Object { $_.letter })
+                    $newLetter = Get-NextFreeDriveLetter -Reserved $reserved
+                    if (-not $newLetter) {
+                        Write-Log "    No drive letters available after collision; skipping $($share.UNC)" -Level WARN
+                        $skipShare = $true
+                    } else {
+                        $letter = $newLetter
+                    }
+                }
+            }
+            if ($skipShare) { continue }
+
+            $mapped = New-MappedDrive -Letter $letter -UNC $share.UNC -Persistent $assignment.Persistent
+            if ($mapped) {
+                Set-NetworkDriveLabel -UNC $share.UNC -ShareName $share.Name -ShortHostName $shortHost
+                if (-not $assignment.FromConfig) {
+                    Add-ConfigMapping -Config $config -UNC $share.UNC -Letter $letter -Persistent $assignment.Persistent
+                    Write-Config -Config $config
+                    Write-Log "    Auto-learned: ${letter}: -> $($share.UNC) saved to config (FR-14.3)"
+                }
+            }
         }
     }
 

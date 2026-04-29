@@ -48,7 +48,14 @@ A PowerShell script that runs on a Windows 11 workgroup machine and automaticall
   - **FR-7.6.** If all resolution methods fail, fall back to `\\IP\Share` and write a warning to the log indicating that a stable name (static DNS / hosts file entry, or enabling mDNS/Avahi on the host) is recommended.
 - **FR-8.** For each responsive host, enumerate available SMB shares.
   - **FR-8.1.** Enumeration must work against an authenticated session — i.e. after stored credentials from FR-12 have been applied to the host (typically by establishing an `IPC$` connection first), share enumeration must succeed.
-  - **FR-8.2.** Enumeration must work against modern Windows hosts (Windows 10/11 with default settings) and modern NAS appliances. Implementations relying solely on legacy mechanisms (e.g. `net view` over the SMB1 Computer Browser service / SRVSVC anonymous enumeration) are insufficient and must be supplemented or replaced. Candidates include: authenticated `net view` after `IPC$` mount, Win32 `WNetEnumResource` API via P/Invoke, `Get-CimInstance Win32_Share` over WSMan, or direct SRVSVC RPC over the authenticated SMB session.
+  - **FR-8.2.** Enumeration must work against modern Windows hosts (Windows 10/11 with default settings) and modern NAS appliances. The script uses the **Win32 `WNetEnumResource` API via P/Invoke** as the primary enumeration mechanism (this is the same API Windows File Explorer uses to browse `\\HOST`). It works against any SMB host the user can authenticate to via the `IPC$` session established per FR-12.1, returns structured data (no locale-dependent text parsing), and automatically excludes IPC and admin shares.
+
+    Spike results (2026-04-29) against `\\MyNAS.local` (FreeNAS, post-IPC$ auth):
+    - `WNetEnumResource` P/Invoke: ✅ returned `home` (auto-filtered IPC$).
+    - `net view \\HOST /all`: ✅ returned `home` and `IPC$` with type info; localized output, requires text parsing.
+    - `Get-CimInstance Win32_Share -ComputerName HOST`: ❌ failed with WinRM TrustedHosts error — incompatible with workgroup environments without configuration the user should not have to do.
+
+    `net view` is retained as a documented **fallback** for the rare case where `WNetEnumResource` fails against a specific host; the script attempts it only when the primary mechanism returns an error other than "host unreachable".
   - **FR-8.3.** If share enumeration fails for an authenticated host, log an error identifying the host and the underlying error code; do not abort the run — continue with other hosts.
 
 ### 4.3 Share Filtering

@@ -261,12 +261,107 @@ function Connect-AuthenticatedSmbSession {
     throw "Connect-AuthenticatedSmbSession not implemented yet"
 }
 
-# === Share enumeration (FR-8, WNetEnumResource per spike) — stub ===
+# === Share enumeration (FR-8, WNetEnumResource per spike) ===
+
+# P/Invoke wrapper for mpr.dll WNetEnumResource — same API File Explorer uses
+# to browse \\HOST. Auto-filters out IPC$ and admin shares. Requires that an
+# authenticated SMB session to the host already exists (FR-12.1).
+if (-not ('AutoMapNetworkDrives.WNet' -as [type])) {
+    $wnetSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace AutoMapNetworkDrives {
+    public static class WNet {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        public class NETRESOURCE {
+            public int dwScope;
+            public int dwType;
+            public int dwDisplayType;
+            public int dwUsage;
+            [MarshalAs(UnmanagedType.LPTStr)] public string lpLocalName;
+            [MarshalAs(UnmanagedType.LPTStr)] public string lpRemoteName;
+            [MarshalAs(UnmanagedType.LPTStr)] public string lpComment;
+            [MarshalAs(UnmanagedType.LPTStr)] public string lpProvider;
+        }
+        [DllImport("mpr.dll", CharSet = CharSet.Auto)]
+        public static extern int WNetOpenEnum(int dwScope, int dwType, int dwUsage, NETRESOURCE lpNetResource, out IntPtr lphEnum);
+        [DllImport("mpr.dll", CharSet = CharSet.Auto)]
+        public static extern int WNetEnumResource(IntPtr hEnum, ref int lpcCount, IntPtr lpBuffer, ref int lpBufferSize);
+        [DllImport("mpr.dll")]
+        public static extern int WNetCloseEnum(IntPtr hEnum);
+
+        public static List<string[]> EnumShares(string remoteName) {
+            var result = new List<string[]>();
+            var root = new NETRESOURCE {
+                dwScope = 2, dwType = 1, dwUsage = 0, lpRemoteName = remoteName
+            };
+            IntPtr hEnum = IntPtr.Zero;
+            int rc = WNetOpenEnum(2, 1, 0, root, out hEnum);
+            if (rc != 0) throw new System.ComponentModel.Win32Exception(rc);
+            try {
+                int bufSize = 16384;
+                IntPtr buf = Marshal.AllocHGlobal(bufSize);
+                try {
+                    while (true) {
+                        int count = -1;
+                        int sz = bufSize;
+                        int er = WNetEnumResource(hEnum, ref count, buf, ref sz);
+                        if (er == 259) break;
+                        if (er != 0) throw new System.ComponentModel.Win32Exception(er);
+                        int structSize = Marshal.SizeOf(typeof(NETRESOURCE));
+                        for (int i = 0; i < count; i++) {
+                            var nr = (NETRESOURCE)Marshal.PtrToStructure(IntPtr.Add(buf, i * structSize), typeof(NETRESOURCE));
+                            result.Add(new[] { nr.lpRemoteName ?? "", nr.lpComment ?? "" });
+                        }
+                    }
+                } finally { Marshal.FreeHGlobal(buf); }
+            } finally { WNetCloseEnum(hEnum); }
+            return result;
+        }
+    }
+}
+"@
+    Add-Type -TypeDefinition $wnetSrc -ErrorAction Stop
+}
 
 function Get-RemoteSharesViaWNet {
-    param([string]$Host)
-    # TODO: WNetEnumResource P/Invoke
-    throw "Get-RemoteSharesViaWNet not implemented yet"
+    param([Parameter(Mandatory)] [string]$ServerName)
+
+    $remote = "\\$ServerName"
+    try {
+        $entries = [AutoMapNetworkDrives.WNet]::EnumShares($remote)
+    } catch {
+        return [pscustomobject]@{
+            Success = $false
+            ErrorCode = $_.Exception.NativeErrorCode
+            Error = $_.Exception.Message
+            Shares = @()
+        }
+    }
+
+    $shares = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $entries) {
+        $unc = $e[0]
+        $comment = $e[1]
+        # WNetEnumResource returns disk shares only; still defensive-filter against
+        # anything ending in $ in case an exotic provider surfaces hidden shares.
+        $name = ($unc -split '\\')[-1]
+        if ($name.EndsWith('$')) { continue }
+        [void]$shares.Add([pscustomobject]@{
+            UNC     = $unc
+            Name    = $name
+            Comment = $comment
+        })
+    }
+
+    [pscustomobject]@{
+        Success = $true
+        ErrorCode = 0
+        Error = $null
+        Shares = $shares
+    }
 }
 
 # === Drive letter assignment (FR-14, FR-15) — stub ===
@@ -322,7 +417,24 @@ try {
             Write-Log "Host $ip - hostname could not be resolved; UNC will use IP" -Level WARN
         }
         Write-Log "Host: $target ($ip)"
-        # TODO (next commits): credentials -> auth session -> enumerate -> map
+
+        # TODO: credentials + auth session establishment (FR-11..FR-12.1).
+        # For now, rely on any pre-existing IPC$ session (e.g. from manual
+        # `net use \\HOST /user:NAME` already done by the user).
+
+        $enumResult = Get-RemoteSharesViaWNet -ServerName $target
+        if (-not $enumResult.Success) {
+            Write-Log ("Host {0} - share enumeration failed (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+            continue
+        }
+        if ($enumResult.Shares.Count -eq 0) {
+            Write-Log "Host $target - no user shares listed"
+            continue
+        }
+        foreach ($share in $enumResult.Shares) {
+            Write-Log ("  Share: {0}{1}" -f $share.UNC, $(if ($share.Comment) { " [$($share.Comment)]" } else { '' }))
+            # TODO (next commits): drive letter assignment + mapping + label
+        }
     }
 
     Write-Log "AutoMapNetworkDrives complete"

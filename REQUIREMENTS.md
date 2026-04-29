@@ -45,6 +45,8 @@ A PowerShell script that runs on a Windows 11 workgroup machine and automaticall
   Implementation note: on Windows, `Resolve-DnsName` covers FR-7.1 through FR-7.3 in a single call; FR-7.4 is provided by `nbtstat -A` as a fallback.
 
   - **FR-7.5.** If a hostname is resolved, mappings use the UNC path `\\HOSTNAME\Share`. The full resolved name is used as-is (e.g. `\\MyNAS.local\Share`); no suffix stripping.
+
+    **Exception (short-name fallback)**: if SMB enumeration against the FQDN fails with `ERROR_BAD_NETPATH` (Win32 53) or `ERROR_BAD_NET_NAME` (Win32 67), the script retries enumeration against the short hostname (everything before the first dot). If the short name produces a successful enumeration — or any error other than 53/67 (e.g. an authentication error, which is still actionable) — the script uses the short name as the working hostname for all downstream operations on that host (auth session, UNC path, mapping, label key, Credential Manager target name). This handles router-DNS suffixes such as `.example.lan`, which the gateway resolves but the target host's SMB stack does not honor.
   - **FR-7.6.** If all resolution methods fail, fall back to `\\IP\Share` and write a warning to the log indicating that a stable name (static DNS / hosts file entry, or enabling mDNS/Avahi on the host) is recommended.
 - **FR-8.** For each responsive host, enumerate available SMB shares.
   - **FR-8.1.** Enumeration must work against an authenticated session — i.e. after stored credentials from FR-12 have been applied to the host (typically by establishing an `IPC$` connection first), share enumeration must succeed.

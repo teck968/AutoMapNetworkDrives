@@ -745,6 +745,27 @@ try {
 
         $enumResult = Get-RemoteSharesViaWNet -ServerName $target
 
+        # FQDN→short retry: some routers (e.g. .example.lan) publish
+        # a DNS suffix the host's SMB stack does not honor; resolution + TCP 445
+        # still succeed but WNet returns BAD_NETPATH (53) or BAD_NET_NAME (67).
+        # If the short name yields a different (success or more informative)
+        # outcome, switch $target to it so auth/UNC/label all use the working
+        # name. Skipped when only an IP was resolved (FR-7.5 exception).
+        if (-not $enumResult.Success -and
+            ($enumResult.ErrorCode -eq 53 -or $enumResult.ErrorCode -eq 67) -and
+            $resolved -and $resolved.Contains('.')) {
+            $short = Get-ShortHostName -ResolvedName $resolved
+            if ($short -and $short -ne $resolved) {
+                Write-Log ("  $target rejected SMB session (Win32 {0}); retrying as $short" -f $enumResult.ErrorCode)
+                $retryResult = Get-RemoteSharesViaWNet -ServerName $short
+                if ($retryResult.Success -or
+                    ($retryResult.ErrorCode -ne 53 -and $retryResult.ErrorCode -ne 67)) {
+                    $target = $short
+                    $enumResult = $retryResult
+                }
+            }
+        }
+
         if (-not $enumResult.Success -and (Test-AuthError $enumResult.ErrorCode)) {
             $stored = Get-StoredCredential -HostName $target
             if ($stored) {

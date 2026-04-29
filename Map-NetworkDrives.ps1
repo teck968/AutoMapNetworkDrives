@@ -536,11 +536,18 @@ function Get-RemoteSharesViaWNet {
     try {
         $entries = [AutoMapNetworkDrives.WNet]::EnumShares($remote)
     } catch {
+        # When C# code throws via [type]::Method(...), PowerShell wraps the
+        # exception in MethodInvocationException. The Win32Exception we threw
+        # is the InnerException (or further down the chain). Unwrap so the
+        # caller sees the real Win32 code and clean message.
+        $ex = $_.Exception
+        while ($ex.InnerException) { $ex = $ex.InnerException }
+        $code = if ($ex -is [System.ComponentModel.Win32Exception]) { $ex.NativeErrorCode } else { 0 }
         return [pscustomobject]@{
-            Success = $false
-            ErrorCode = $_.Exception.NativeErrorCode
-            Error = $_.Exception.Message
-            Shares = @()
+            Success   = $false
+            ErrorCode = $code
+            Error     = $ex.Message
+            Shares    = @()
         }
     }
 

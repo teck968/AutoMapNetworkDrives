@@ -62,10 +62,14 @@ A PowerShell script that runs on a Windows 11 workgroup machine and automaticall
 
 ### 4.4 Credentials
 
-- **FR-11.** When the script encounters a host that requires authentication and no credentials are stored:
-  - **FR-11.1.** During a **manual** run, prompt the user for username and password and store the result in **Windows Credential Manager** keyed by host.
-  - **FR-11.2.** During a **login** run, skip the host and log that credentials are missing.
+- **FR-11.** Credential prompting follows a **two-phase model** in manual mode:
+  - **FR-11.1.** Phase 1 (discovery): scan all hosts, resolve hostnames, and attempt share enumeration using credentials already stored in Windows Credential Manager (FR-12). Hosts without stored credentials are recorded but not prompted-for yet.
+  - **FR-11.2.** Phase 2 (batched prompt): after the full scan completes, present the user with the consolidated list of hosts that require credentials and prompt for each in turn. Each successful prompt result is written to Credential Manager keyed by the resolved hostname.
+  - **FR-11.3.** Phase 3 (mapping): re-attempt enumeration for any host whose credentials were just provided, then proceed with mapping for all hosts that have usable credentials.
+  - **FR-11.4.** During a **login** (silent) run, phase 2 is skipped entirely. Hosts without stored credentials are logged and skipped without prompting.
+  - **FR-11.5.** Credentials in Credential Manager are stored under the target name `AutoMapNetworkDrives:<resolved-hostname>`, where `<resolved-hostname>` is the same value used in the UNC path per FR-7.5 (full FQDN, including `.local` if present).
 - **FR-12.** When credentials are already stored in Credential Manager for a host, retrieve and use them silently.
+  - **FR-12.1.** Before invoking the chosen share-enumeration mechanism (FR-8) against a host that requires authentication, the script must establish an authenticated SMB session by mounting `\\HOST\IPC$` with the available credentials (e.g. `net use \\HOST\IPC$ /user:NAME password`). Enumeration is attempted only after the session is established. If session establishment fails (bad credentials → System error 1326, or similar), the host is treated as auth-required-but-unknown for this run, and re-prompted in phase 2 (manual mode) or skipped (login mode).
 - **FR-13.** Credentials are never written to the config file or log files.
 
 ### 4.5 Drive Letter Assignment
@@ -133,7 +137,7 @@ A PowerShell script that runs on a Windows 11 workgroup machine and automaticall
 
 ## 5. Non-Functional Requirements
 
-- **NFR-1.** **Platform**: Windows 11. PowerShell 7+ recommended (for `ForEach-Object -Parallel`); fall back gracefully if only Windows PowerShell 5.1 is available, or document 7+ as a hard requirement.
+- **NFR-1.** **Platform**: Windows 11. **Windows PowerShell 5.1 is the baseline target** — the script must run on a stock Windows 11 install with no additional PowerShell installation. The script must also run unchanged on **PowerShell 7+** (`pwsh`). This rules out PS 7-only constructs (e.g. `ForEach-Object -Parallel`, ternary operator, null-coalescing) in favor of constructs supported by both versions (e.g. async tasks, runspace pools).
 - **NFR-2.** **Runtime**: zero external dependencies beyond what ships with Windows + PowerShell. No additional modules from the Gallery.
 - **NFR-3.** **Performance**: a full scan of a /24 subnet must complete in under 5 seconds with default settings on a typical LAN.
 - **NFR-4.** **Resilience**: a single unreachable / misbehaving host must not block the scan or the script's overall completion.

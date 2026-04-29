@@ -79,12 +79,28 @@ A PowerShell script that runs on a Windows 11 workgroup machine and automaticall
   - Is currently in use by an existing network mapping.
   - Is reserved by the config file for a different `\\HOST\Share` (even if that share is currently unreachable).
 
-### 4.6 Mapping Persistence
+### 4.6 Drive Display Label
+
+- **FR-34.** When a network drive is mapped, the script sets a friendly display label of the form:
+  ```
+  <sharename> on <short-hostname>
+  ```
+  where `<sharename>` is the share name as enumerated (e.g. `home`) and `<short-hostname>` is the resolved hostname with everything after the first dot removed (e.g. `MyPC.example.lan` → `MyPC`; `MyNAS.local` → `MyNAS`).
+- **FR-35.** Hostname casing in the label is preserved verbatim from the resolver — no transformation (no acronym expansion, no case normalization). If the resolver returned `MyPC`, the label uses `MyPC`.
+- **FR-36.** The label is implemented by writing a `_LabelFromReg` REG_SZ value under the per-user MountPoints2 registry key for the mapping:
+  ```
+  HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##<host>#<share>\_LabelFromReg
+  ```
+  where `<host>` and `<share>` reflect the actual UNC components used for the mapping (with `#` separators in the registry key name).
+- **FR-37.** The custom label is set immediately after a mapping is created (or on each run, for idempotency); it is removed when the mapping is removed.
+- **FR-38.** Custom labels affect display only and have no effect on UNC resolution — UNC paths continue to use the full resolved hostname per FR-7.5.
+
+### 4.7 Mapping Persistence
 
 - **FR-16.** Mappings created from explicit config entries are created with the `-Persistent` flag (Windows reconnects them at logon independently of the script).
 - **FR-17.** Mappings created from auto-discovered shares are created **session-only** (no `-Persistent`); they are recreated each run.
 
-### 4.7 Conflict Handling
+### 4.8 Conflict Handling
 
 - **FR-18.** Same share on the same letter → no-op; do not disturb the existing mapping.
 - **FR-19.** Wanted drive letter currently holds a *different* network share → choose a different letter via the auto-assignment rules in FR-15; do not disconnect the existing mapping.
@@ -93,7 +109,7 @@ A PowerShell script that runs on a Windows 11 workgroup machine and automaticall
 - **FR-22.** A persistent mapping points to an unreachable host → leave it alone (respect the user's config and Windows' own behavior).
 - **FR-23.** An auto-discovered (session-only) mapping from a previous run points to a host that is no longer reachable → unmap it.
 
-### 4.8 Configuration
+### 4.9 Configuration
 
 - **FR-24.** Config file path: `%APPDATA%\AutoMapNetworkDrives\config.json`.
 - **FR-25.** Config file format: JSON.
@@ -104,7 +120,7 @@ A PowerShell script that runs on a Windows 11 workgroup machine and automaticall
   - Scan parallelism, default 64.
 - **FR-28.** Drive letter preferences from the config are honored across runs; entries written by auto-learn are functionally identical to entries written by the user.
 
-### 4.9 Output & Logging
+### 4.10 Output & Logging
 
 - **FR-29.** Manual runs print progress lines to the console (subnet being scanned, hosts found, shares being mapped, conflicts skipped, errors).
 - **FR-30.** Login runs are silent (no console window shown to the user).

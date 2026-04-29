@@ -439,7 +439,8 @@ function Connect-AuthenticatedSmbSession {
 
     $user = $Credential.UserName
     $pass = $Credential.GetNetworkCredential().Password
-    $rc   = [AutoMapNetworkDrives.WNet]::AddConnection($unc, $user, $pass, $false)
+    # localName is null — IPC$ is an authentication-only session, no drive letter.
+    $rc   = [AutoMapNetworkDrives.WNet]::AddConnection($unc, $null, $user, $pass, $false)
 
     # 1219 = ERROR_SESSION_CREDENTIAL_CONFLICT (a different cred is already in
     # use for this server). Tear down and retry once. We cancel only \\HOST\IPC$
@@ -447,7 +448,7 @@ function Connect-AuthenticatedSmbSession {
     # server under different shares.
     if ($rc -eq 1219) {
         [void][AutoMapNetworkDrives.WNet]::CancelConnection($unc, $true)
-        $rc = [AutoMapNetworkDrives.WNet]::AddConnection($unc, $user, $pass, $false)
+        $rc = [AutoMapNetworkDrives.WNet]::AddConnection($unc, $null, $user, $pass, $false)
     }
 
     if ($rc -eq 0) {
@@ -495,11 +496,15 @@ namespace AutoMapNetworkDrives {
         [DllImport("mpr.dll", CharSet = CharSet.Auto)]
         public static extern int WNetCancelConnection2(string lpName, int dwFlags, bool fForce);
 
-        public static int AddConnection(string remoteName, string user, string password, bool persistent) {
+        public static int AddConnection(string remoteName, string localName, string user, string password, bool persistent) {
+            // localName: drive letter like "X:" to bind the mapping to a letter
+            // visible in Explorer, or null for an authentication-only session
+            // (e.g. \\HOST\IPC$ where no drive letter is wanted).
             var nr = new NETRESOURCE {
                 dwScope = 1,    // RESOURCE_GLOBALNET
                 dwType = 1,     // RESOURCETYPE_DISK
                 dwUsage = 1,    // RESOURCEUSAGE_CONNECTABLE
+                lpLocalName = localName,
                 lpRemoteName = remoteName
             };
             int flags = persistent ? 1 : 0; // CONNECT_UPDATE_PROFILE = 1
@@ -689,20 +694,37 @@ function New-MappedDrive {
         Write-Log "[dry-run] Would map ${Letter}: -> $UNC (persistent=$Persistent)"
         return $true
     }
-    try {
-        New-SmbMapping -LocalPath "${Letter}:" -RemotePath $UNC -Persistent:$Persistent -ErrorAction Stop | Out-Null
+    # Use net.exe rather than New-SmbMapping or raw WNetAddConnection2.
+    # New-SmbMapping has been observed to create "ghost" mappings — visible to
+    # Get-SmbMapping but not to the user's Explorer shell. Raw
+    # WNetAddConnection2 with null user/password fails with Win32 1937
+    # (NTLM_DISABLED) on hardened Windows 11 even when the LSA credential
+    # cache holds usable credentials, because the API does not walk that
+    # cache. net.exe goes through WNetUseConnection which DOES consult the
+    # cache, and is the same path File Explorer's "Map network drive" wizard
+    # uses. Empirically: net.exe creates drives that propagate to the shell.
+    # cmd /c …2>&1 captures stderr cleanly under PS 5.1 (where bare 2>&1 on
+    # a native exe produces NativeCommandError ErrorRecords that pollute $?).
+    $persistArg = if ($Persistent) { 'yes' } else { 'no' }
+    $cmdLine = 'net.exe use "{0}:" "{1}" /persistent:{2} 2>&1' -f $Letter, $UNC, $persistArg
+    $output  = cmd /c $cmdLine
+    $ec      = $LASTEXITCODE
+    if ($ec -eq 0) {
         Write-Log "Mapped ${Letter}: -> $UNC (persistent=$Persistent)"
         return $true
-    } catch {
-        Write-Log "Failed to map ${Letter}: -> $UNC : $($_.Exception.Message)" -Level ERROR
-        # Track the failure so subsequent shares don't keep trying the same letter.
-        # Get-UsedDriveLetters consults this set on each call.
-        if (-not $Script:FailedLetters) {
-            $Script:FailedLetters = New-Object System.Collections.Generic.HashSet[string]
-        }
-        [void]$Script:FailedLetters.Add($Letter.ToUpper())
-        return $false
     }
+    $errCode = 0
+    foreach ($line in $output) {
+        if ($line -match 'System error (\d+) has occurred') { $errCode = [int]$matches[1]; break }
+    }
+    Write-Log ("Failed to map {0}: -> {1} (net.exe exit {2}, Win32 {3}): {4}" -f $Letter, $UNC, $ec, $errCode, ($output -join '; ')) -Level ERROR
+    # Track the failure so subsequent shares don't keep trying the same letter.
+    # Get-UsedDriveLetters consults this set on each call.
+    if (-not $Script:FailedLetters) {
+        $Script:FailedLetters = New-Object System.Collections.Generic.HashSet[string]
+    }
+    [void]$Script:FailedLetters.Add($Letter.ToUpper())
+    return $false
 }
 
 function Test-MappingConflict {
@@ -710,15 +732,37 @@ function Test-MappingConflict {
         [Parameter(Mandatory)] [string]$Letter,
         [Parameter(Mandatory)] [string]$UNC
     )
-    # Returns one of: 'NoOp' | 'Free' | 'LetterTaken' | 'AlreadyElsewhere'
+    # Returns one of: 'NoOp' | 'Ghost' | 'Free' | 'LetterTaken' | 'AlreadyElsewhere'
+    # 'Ghost' = SMB redirector knows about the mapping but the drive letter is
+    # not accessible to this session (left over from a prior elevated run, or
+    # from New-SmbMapping which sometimes fails to propagate to the shell).
+    # Caller should remove + rebuild on Ghost.
     $byLetter = Get-SmbMapping -LocalPath "${Letter}:" -ErrorAction SilentlyContinue
-    if ($byLetter -and $byLetter.RemotePath -ieq $UNC) { return 'NoOp' }
+    if ($byLetter -and $byLetter.RemotePath -ieq $UNC) {
+        if (Test-Path "${Letter}:\" -ErrorAction SilentlyContinue) { return 'NoOp' }
+        return 'Ghost'
+    }
     if ($byLetter) { return 'LetterTaken' }
     $byUnc = Get-SmbMapping -RemotePath $UNC -ErrorAction SilentlyContinue
     if ($byUnc) { return 'AlreadyElsewhere' }
     $used = Get-UsedDriveLetters
     if ($used.Contains([string]$Letter.ToUpper())) { return 'LetterTaken' }
     return 'Free'
+}
+
+function Remove-StaleSmbMapping {
+    param([Parameter(Mandatory)] [string]$Letter)
+    if ($Script:DryRun) {
+        Write-Log "    [dry-run] Would remove stale mapping on ${Letter}:"
+        return
+    }
+    # Try MPR cancel first (matches the API used to create new mappings); fall
+    # back to Remove-SmbMapping for entries created by older script versions.
+    $rc = [AutoMapNetworkDrives.WNet]::CancelConnection("${Letter}:", $true)
+    if ($rc -ne 0) {
+        Get-SmbMapping -LocalPath "${Letter}:" -ErrorAction SilentlyContinue |
+            Remove-SmbMapping -Force -UpdateProfile -ErrorAction SilentlyContinue
+    }
 }
 
 function Add-ConfigMapping {
@@ -926,6 +970,11 @@ try {
                     Write-Log "    ${letter}: already mapped to $($share.UNC); no-op (FR-18)"
                     Set-NetworkDriveLabel -UNC $share.UNC -ShareName $share.Name -ShortHostName $shortHost
                     $skipShare = $true
+                }
+                'Ghost' {
+                    Write-Log "    ${letter}: registered to $($share.UNC) but not visible in this session (stale); removing and remapping" -Level WARN
+                    Remove-StaleSmbMapping -Letter $letter
+                    # Fall through (do not set $skipShare) so the mapping below recreates it.
                 }
                 'AlreadyElsewhere' {
                     Write-Log "    $($share.UNC) already mapped under a different letter; leaving as-is (FR-21)"

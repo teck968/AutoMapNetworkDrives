@@ -410,6 +410,21 @@ function Test-AuthError {
     return $authCodes -contains $ErrorCode
 }
 
+function Test-BadNetPathError {
+    param([int]$ErrorCode)
+    # Win32 codes that mean "the network name/path was rejected at the network
+    # provider level" — distinct from auth errors. These trigger the FQDN→short
+    # hostname retry per FR-7.5. All three share an identical English message
+    # ("The network path was either typed incorrectly..."), so the numeric code
+    # is the only way to distinguish them in code.
+    $codes = @(
+        53,   # ERROR_BAD_NETPATH
+        67,   # ERROR_BAD_NET_NAME
+        1203  # ERROR_NO_NET_OR_BAD_PATH
+    )
+    return $codes -contains $ErrorCode
+}
+
 function Connect-AuthenticatedSmbSession {
     param(
         [Parameter(Mandatory)] [string]$HostName,
@@ -747,19 +762,18 @@ try {
 
         # FQDN→short retry: some routers (e.g. .example.lan) publish
         # a DNS suffix the host's SMB stack does not honor; resolution + TCP 445
-        # still succeed but WNet returns BAD_NETPATH (53) or BAD_NET_NAME (67).
-        # If the short name yields a different (success or more informative)
-        # outcome, switch $target to it so auth/UNC/label all use the working
-        # name. Skipped when only an IP was resolved (FR-7.5 exception).
+        # still succeed but WNet returns one of the "bad net path" codes (53,
+        # 67, 1203). If the short name yields a different (success or more
+        # informative) outcome, switch $target to it so auth/UNC/label all use
+        # the working name. Skipped when only an IP was resolved (FR-7.5 exception).
         if (-not $enumResult.Success -and
-            ($enumResult.ErrorCode -eq 53 -or $enumResult.ErrorCode -eq 67) -and
+            (Test-BadNetPathError $enumResult.ErrorCode) -and
             $resolved -and $resolved.Contains('.')) {
             $short = Get-ShortHostName -ResolvedName $resolved
             if ($short -and $short -ne $resolved) {
                 Write-Log ("  $target rejected SMB session (Win32 {0}); retrying as $short" -f $enumResult.ErrorCode)
                 $retryResult = Get-RemoteSharesViaWNet -ServerName $short
-                if ($retryResult.Success -or
-                    ($retryResult.ErrorCode -ne 53 -and $retryResult.ErrorCode -ne 67)) {
+                if ($retryResult.Success -or -not (Test-BadNetPathError $retryResult.ErrorCode)) {
                     $target = $short
                     $enumResult = $retryResult
                 }

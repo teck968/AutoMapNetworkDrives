@@ -1,0 +1,83 @@
+name: Bug report
+description: Something in AutoMapNetworkDrives didn't work the way the README / requirements say it should.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing an issue. Please include enough detail that someone reading this in three months can reproduce the problem from a cold start.
+
+        **Don't paste real credentials or hostnames you don't want public.** Replace with placeholders (e.g. `MY-PC`, `\\HOST\share`) where it doesn't change the meaning of the report.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you run, and what did you observe?
+      placeholder: |
+        Ran `.\Map-NetworkDrives.cmd -Detailed`. It found 3 hosts but then errored on one of them with `Win32 1326`. The other two mapped fine.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      placeholder: All three hosts to map, or a clearer error.
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: From `winver` or `Get-ComputerInfo | Select OsName, OsVersion`.
+      placeholder: "Windows 11 23H2 (build 22631.xxxx)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pwsh
+    attributes:
+      label: PowerShell version
+      description: Run `$PSVersionTable.PSVersion` to check. The launcher uses `powershell.exe` (5.1) by default.
+      options:
+        - "Windows PowerShell 5.1 (in-box)"
+        - "PowerShell 7.x (pwsh)"
+        - "Both — same problem in both"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit SHA you're on
+      description: Run `git -C <repo path> rev-parse --short HEAD`.
+      placeholder: "841c682"
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: |
+        Last ~30 lines from `%LOCALAPPDATA%\AutoMapNetworkDrives\logs\map.log` covering the failure. Scrub any real hostnames you'd rather not publish.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: pre-flight
+    attributes:
+      label: Pre-flight checks
+      description: A few quick gotchas that account for most reports.
+      options:
+        - label: "I'm running the script **non-elevated** (Administrator-context drives are invisible to your normal Explorer — this is the most common cause of \"the script said success but I see nothing\")."
+          required: false
+        - label: "I tried with `-Detailed` and looked at the full log stream."
+          required: false
+        - label: "I checked the README's **Dev notes** section for the unmap commands and tried again from a clean state."
+          required: false

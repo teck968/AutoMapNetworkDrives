@@ -4,7 +4,7 @@
     their user shares as Windows network drives.
 
 .DESCRIPTION
-    Implements the v1 design in REQUIREMENTS.md. Runs in two modes:
+    Implements the v1 design in docs/REQUIREMENTS.md. Runs in two modes:
       * Manual (default): writes to log AND echoes to console; in this mode
         the user is prompted for credentials when needed (FR-11.1..11.3).
       * Silent (-Silent): writes only to log; skips any host without stored

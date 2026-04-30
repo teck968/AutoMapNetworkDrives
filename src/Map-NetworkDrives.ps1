@@ -338,9 +338,18 @@ namespace AutoMapNetworkDrives {
         private static extern void CredFree(IntPtr buffer);
 
         public static bool TryRead(string target, out string user, out string secret) {
+            return TryRead(target, CRED_TYPE_GENERIC, out user, out secret);
+        }
+
+        // Overload accepting a credential type. Note: for CRED_TYPE_DOMAIN_PASSWORD,
+        // Windows deliberately does not return the secret blob to user-mode callers
+        // (only LSA may decrypt it) — `secret` will come back empty. Target name
+        // and user name are returned for both types and suffice to verify that
+        // a write of the expected shape persisted.
+        public static bool TryRead(string target, int credType, out string user, out string secret) {
             user = null; secret = null;
             IntPtr p = IntPtr.Zero;
-            if (!CredRead(target, CRED_TYPE_GENERIC, 0, out p)) {
+            if (!CredRead(target, credType, 0, out p)) {
                 int err = Marshal.GetLastWin32Error();
                 if (err == ERROR_NOT_FOUND) return false;
                 throw new System.ComponentModel.Win32Exception(err);
@@ -432,6 +441,43 @@ function Get-StoredCredential {
     return [pscredential]::new($user, $sec)
 }
 
+function Confirm-WrittenCredential {
+    # Lightweight readback verification after a CredWrite. Confirms an entry
+    # of the expected type exists at the expected target and carries the
+    # expected user name. Catches the rare case where CredWrite returns
+    # success but the entry didn't materialize, plus any future regression
+    # that writes the wrong type/target/user. The password blob is NOT
+    # verified — for Domain Password credentials Windows does not return
+    # it to user-mode callers (only LSA decrypts), and for Generic
+    # credentials the storage layer does not transform secrets, so a
+    # target+user match is sufficient evidence the write succeeded as
+    # written. Returns $true on success, $false otherwise (and logs WARN
+    # describing the mismatch).
+    param(
+        [Parameter(Mandatory)] [string]$Target,
+        [Parameter(Mandatory)] [int]$CredType,
+        [Parameter(Mandatory)] [string]$ExpectedUser
+    )
+    $u = $null
+    $s = $null
+    try {
+        $found = [AutoMapNetworkDrives.Cred]::TryRead($Target, $CredType, [ref]$u, [ref]$s)
+    } catch {
+        Write-Status "Could not verify credential at ${Target}: $($_.Exception.Message)" -Level WARN
+        return $false
+    }
+    if (-not $found) {
+        Write-Status "Credential verification failed: $Target not found after write" -Level WARN
+        return $false
+    }
+    if ($u -ine $ExpectedUser) {
+        Write-Status "Credential verification mismatch at ${Target}: expected user '$ExpectedUser', got '$u'" -Level WARN
+        return $false
+    }
+    Write-Log "Verified credential for $Target"
+    return $true
+}
+
 function Save-StoredCredential {
     param(
         [Parameter(Mandatory)] [string]$HostName,
@@ -445,6 +491,7 @@ function Save-StoredCredential {
     $plain  = $Credential.GetNetworkCredential().Password
     [AutoMapNetworkDrives.Cred]::Write($target, $Credential.UserName, $plain, [AutoMapNetworkDrives.Cred]::CRED_TYPE_GENERIC)
     Write-Log "Stored credential in Credential Manager for $HostName"
+    [void](Confirm-WrittenCredential -Target $target -CredType ([AutoMapNetworkDrives.Cred]::CRED_TYPE_GENERIC) -ExpectedUser $Credential.UserName)
 }
 
 function Register-AutoReconnectCredential {
@@ -471,6 +518,7 @@ function Register-AutoReconnectCredential {
     try {
         [AutoMapNetworkDrives.Cred]::Write($HostName, $Credential.UserName, $plain, [AutoMapNetworkDrives.Cred]::CRED_TYPE_DOMAIN_PASSWORD)
         Write-Log "Registered Windows auto-reconnect credential for $HostName"
+        [void](Confirm-WrittenCredential -Target $HostName -CredType ([AutoMapNetworkDrives.Cred]::CRED_TYPE_DOMAIN_PASSWORD) -ExpectedUser $Credential.UserName)
     } catch {
         Write-Log "Could not register auto-reconnect credential for ${HostName}: $($_.Exception.Message)" -Level WARN
     }

@@ -1066,23 +1066,42 @@ try {
         foreach ($h in $needsCreds) { Write-Status "  - $h" }
 
         foreach ($target in $needsCreds) {
-            $cred = $null
-            try {
-                $cred = Get-Credential -Message "Credentials for \\$target"
-            } catch {
-                Write-Status "  Credential prompt failed for ${target}: $($_.Exception.Message)" -Level WARN
-                $Script:CountSkipped++
-                continue
-            }
-            if (-not $cred) {
-                Write-Status "  No credentials provided for $target; skipping" -Level WARN
-                $Script:CountSkipped++
-                continue
+            # Retry on mistyped credentials. 1326 (LOGON_FAILURE) and 86
+            # (INVALID_PASSWORD) are the typo signals — offer the user a
+            # second/third chance. Other auth errors (account locked, disabled,
+            # password expired) skip immediately because re-prompting won't
+            # help and could trigger lockout. Capped at 3 attempts total.
+            $maxAttempts    = 3
+            $cred           = $null
+            $authSucceeded  = $false
+            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                try {
+                    $cred = Get-Credential -Message "Credentials for \\$target"
+                } catch {
+                    Write-Status "  Credential prompt failed for ${target}: $($_.Exception.Message)" -Level WARN
+                    break
+                }
+                if (-not $cred) {
+                    Write-Status "  No credentials provided for $target; skipping" -Level WARN
+                    break
+                }
+
+                $auth = Connect-AuthenticatedSmbSession -HostName $target -Credential $cred
+                if ($auth.Success) { $authSucceeded = $true; break }
+
+                Write-Status ("  Authentication failed for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
+
+                $isTypo = ($auth.ErrorCode -eq 1326) -or ($auth.ErrorCode -eq 86)
+                if (-not $isTypo) { break }
+                if ($attempt -ge $maxAttempts) {
+                    Write-Status "  Maximum retry attempts reached for $target; skipping." -Level WARN
+                    break
+                }
+                $reply = Read-Host -Prompt "  Try again? [Y/n]"
+                if ($reply -match '^[nN]') { break }
             }
 
-            $auth = Connect-AuthenticatedSmbSession -HostName $target -Credential $cred
-            if (-not $auth.Success) {
-                Write-Status ("  Authentication failed for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
+            if (-not $authSucceeded) {
                 $Script:CountSkipped++
                 continue
             }

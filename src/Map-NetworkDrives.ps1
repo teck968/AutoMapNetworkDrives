@@ -345,6 +345,85 @@ namespace AutoMapNetworkDrives {
         [DllImport("advapi32.dll")]
         private static extern void CredFree(IntPtr buffer);
 
+        // === Credential UI prompt — Win32 CredUI direct, bypassing PS host UI ===
+        // Get-Credential routes through PowerShell's host UI, whose behavior
+        // depends on ConsolePrompting registry policy and invocation context;
+        // some configurations cause it to block waiting for a dialog that
+        // never renders. Calling CredUI directly with an explicit console
+        // window as parent HWND avoids that whole layer.
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct CREDUI_INFO {
+            public int    cbSize;
+            public IntPtr hwndParent;
+            [MarshalAs(UnmanagedType.LPWStr)] public string pszMessageText;
+            [MarshalAs(UnmanagedType.LPWStr)] public string pszCaptionText;
+            public IntPtr hbmBanner;
+        }
+
+        public const int CREDUI_FLAGS_GENERIC_CREDENTIALS  = 0x40000;
+        public const int CREDUI_FLAGS_DO_NOT_PERSIST       = 0x2;
+        public const int CREDUI_FLAGS_ALWAYS_SHOW_UI       = 0x80;
+        public const int CREDUI_FLAGS_EXCLUDE_CERTIFICATES = 0x8;
+        public const int CREDUI_MAX_USERNAME_LENGTH = 513;
+        public const int CREDUI_MAX_PASSWORD_LENGTH = 256;
+        public const int ERROR_CANCELLED = 1223;
+
+        [DllImport("credui.dll", EntryPoint = "CredUIPromptForCredentialsW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int CredUIPromptForCredentials(
+            ref CREDUI_INFO pUiInfo,
+            string pszTargetName,
+            IntPtr Reserved,
+            int dwAuthError,
+            StringBuilder pszUserName,
+            int ulUserNameMaxChars,
+            StringBuilder pszPassword,
+            int ulPasswordMaxChars,
+            ref bool pfSave,
+            int dwFlags);
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetConsoleWindow();
+
+        public class CredentialPromptResult {
+            public bool   Cancelled;
+            public bool   Success;
+            public int    ErrorCode;
+            public string UserName;
+            public string Password;
+        }
+
+        public static CredentialPromptResult PromptForCredential(string targetName, string caption, string message, IntPtr hwndParent) {
+            var info = new CREDUI_INFO {
+                cbSize         = Marshal.SizeOf(typeof(CREDUI_INFO)),
+                hwndParent     = hwndParent,
+                pszCaptionText = caption,
+                pszMessageText = message,
+                hbmBanner      = IntPtr.Zero
+            };
+            var user = new StringBuilder(CREDUI_MAX_USERNAME_LENGTH + 1);
+            var pass = new StringBuilder(CREDUI_MAX_PASSWORD_LENGTH + 1);
+            bool save = false;
+            int flags = CREDUI_FLAGS_GENERIC_CREDENTIALS
+                      | CREDUI_FLAGS_ALWAYS_SHOW_UI
+                      | CREDUI_FLAGS_DO_NOT_PERSIST
+                      | CREDUI_FLAGS_EXCLUDE_CERTIFICATES;
+            int rc = CredUIPromptForCredentials(
+                ref info, targetName, IntPtr.Zero, 0,
+                user, CREDUI_MAX_USERNAME_LENGTH,
+                pass, CREDUI_MAX_PASSWORD_LENGTH,
+                ref save, flags);
+            var result = new CredentialPromptResult { ErrorCode = rc };
+            if (rc == 0) {
+                result.Success  = true;
+                result.UserName = user.ToString();
+                result.Password = pass.ToString();
+            } else if (rc == ERROR_CANCELLED) {
+                result.Cancelled = true;
+            }
+            return result;
+        }
+
         public static bool TryRead(string target, out string user, out string secret) {
             return TryRead(target, CRED_TYPE_GENERIC, out user, out secret);
         }
@@ -500,6 +579,41 @@ function Save-StoredCredential {
     [AutoMapNetworkDrives.Cred]::Write($target, $Credential.UserName, $plain, [AutoMapNetworkDrives.Cred]::CRED_TYPE_GENERIC)
     Write-Log "Stored credential in Credential Manager for $HostName"
     [void](Confirm-WrittenCredential -Target $target -CredType ([AutoMapNetworkDrives.Cred]::CRED_TYPE_GENERIC) -ExpectedUser $Credential.UserName)
+}
+
+function Read-CredentialReliable {
+    # Replacement for Get-Credential that calls Win32 CredUI directly, parented
+    # to our console window, with a Read-Host fallback if the GUI fails. Avoids
+    # PowerShell's host-UI layer, whose behavior with credential prompts varies
+    # by invocation context (-File vs interactive), the ConsolePrompting
+    # registry policy, and other things — Get-Credential has been observed to
+    # block on a dialog that never renders.
+    param(
+        [Parameter(Mandatory)] [string]$TargetName,
+        [Parameter(Mandatory)] [string]$Message,
+        [string]$Caption = $Script:AppName
+    )
+
+    # Primary path: CredUI dialog with console window as explicit parent.
+    try {
+        $hwnd   = [AutoMapNetworkDrives.Cred]::GetConsoleWindow()
+        $result = [AutoMapNetworkDrives.Cred]::PromptForCredential($TargetName, $Caption, $Message, $hwnd)
+        if ($result.Cancelled) { return $null }
+        if ($result.Success) {
+            $sec = ConvertTo-SecureString -String $result.Password -AsPlainText -Force
+            return [pscredential]::new($result.UserName, $sec)
+        }
+        Write-Status ("  Credential dialog failed (Win32 {0}); falling back to console prompt." -f $result.ErrorCode) -Level WARN
+    } catch {
+        Write-Status ("  Credential dialog threw ({0}); falling back to console prompt." -f $_.Exception.Message) -Level WARN
+    }
+
+    # Fallback: console-only prompts via Read-Host. Always renders.
+    if (-not $Script:Silent) { Write-Host "  $Message" }
+    $user = Read-Host -Prompt "  User name (Enter to cancel)"
+    if ([string]::IsNullOrWhiteSpace($user)) { return $null }
+    $sec  = Read-Host -Prompt "  Password" -AsSecureString
+    return [pscredential]::new($user, $sec)
 }
 
 function Test-AutoReconnectCredentialExists {
@@ -1123,7 +1237,7 @@ try {
             $authSucceeded  = $false
             for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
                 try {
-                    $cred = Get-Credential -Message "Credentials for \\$target"
+                    $cred = Read-CredentialReliable -TargetName $target -Message "Credentials for \\$target"
                 } catch {
                     Write-Status "  Credential prompt failed for ${target}: $($_.Exception.Message)" -Level WARN
                     break

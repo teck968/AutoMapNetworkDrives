@@ -52,7 +52,11 @@ The script is idempotent: shares already mapped to the correct letter are left a
 
 ## Auto-update
 
-When you launch via `Map-NetworkDrives.cmd` and the folder is a git clone of this repository, the launcher automatically fetches and fast-forwards to `origin` before invoking the PowerShell script. Updates to `Map-NetworkDrives.ps1` take effect on the same run; updates to `Map-NetworkDrives.cmd` itself land on the next run. If `git` is missing but `winget` is available, the launcher installs `Git.Git` first (one-time, may UAC prompt). Auto-update skips silently if you're offline, or with a short message if your local branch has diverged from origin. Pass `-NoUpdate` to bypass for a single invocation.
+When you launch via `Map-NetworkDrives.cmd` and the folder is a git clone of this repository, the launcher automatically fetches and fast-forwards to `origin` before invoking the PowerShell script. Updates to `Map-NetworkDrives.ps1` take effect on the same run; updates to `Map-NetworkDrives.cmd` itself land on the next run.
+
+Auto-update is mostly invisible: when there's nothing to pull (you're already up to date) or when origin is unreachable (offline), the launcher stays silent. When commits were actually pulled, it prints one line — `[auto-update] Updated to <short-SHA>.` — so you know your run is on a newer version than the previous one. The diverged-history case prints a brief message pointing you at `git status` / `git reset --hard origin/main`.
+
+If `git` is missing but `winget` is available, the launcher installs `Git.Git` first (one-time, may UAC prompt). Pass `-NoUpdate` to bypass auto-update for a single invocation.
 
 ## Where things live
 

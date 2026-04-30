@@ -46,8 +46,13 @@ The script is idempotent: shares already mapped to the correct letter are left a
 | `-DryRun` | Discover and enumerate, but do not map drives, write config, or set labels. |
 | `-Detailed` | Mirror the full log stream to the console (timestamped lines, every entry — same content as the log file). Without this flag, the console shows only the end-user-relevant lines: host headers, drive map results, warnings, errors, and a closing summary. |
 | `-Silent` | Suppress all console output and skip credential prompts. Hosts without stored creds are logged and skipped. Intended for batch / scripted re-runs. Takes precedence over `-Detailed` if both are passed. |
+| `-NoUpdate` | Skip the launcher's auto-update step (the fast-forward `git pull` it normally runs before invoking the PowerShell script). Useful when developing locally. |
 | `-TimeoutMs N` | Override the per-batch TCP 445 probe timeout (milliseconds). |
 | `-Parallelism N` | Override the number of concurrent TCP probes per batch. |
+
+## Auto-update
+
+When you launch via `Map-NetworkDrives.cmd` and the folder is a git clone of this repository, the launcher automatically fetches and fast-forwards to `origin` before invoking the PowerShell script. Updates to `Map-NetworkDrives.ps1` take effect on the same run; updates to `Map-NetworkDrives.cmd` itself land on the next run. If `git` is missing but `winget` is available, the launcher installs `Git.Git` first (one-time, may UAC prompt). Auto-update skips silently if you're offline, or with a short message if your local branch has diverged from origin. Pass `-NoUpdate` to bypass for a single invocation.
 
 ## Where things live
 

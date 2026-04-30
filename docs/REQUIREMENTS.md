@@ -153,6 +153,13 @@ A PowerShell script that, when run manually on a Windows 11 workgroup machine, d
   - Keep **3** backups (`map.log.1`, `map.log.2`, `map.log.3`); older files are deleted.
 - **FR-33.** Log entries include timestamp, severity (INFO / WARN / ERROR), and message. No credentials are ever logged.
 
+### 4.11 Auto-Update
+
+- **FR-39.** When invoked through the launcher (`Map-NetworkDrives.cmd`), if the launcher folder is a git working tree (i.e. has a `.git` subdirectory) and the network is reachable, the launcher attempts a fast-forward `git pull` from origin before starting the PowerShell script. Updates to `src/Map-NetworkDrives.ps1` take effect on the same run because the pull happens in the launcher (cmd) before PowerShell parses the script. Updates to `Map-NetworkDrives.cmd` itself take effect on the next run.
+  - **FR-39.1.** If `git` is not installed but `winget` is available, the launcher first installs the Git for Windows package via `winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements`. May trigger a UAC prompt depending on system policy.
+  - **FR-39.2.** If git is unavailable (and winget cannot install it), origin is unreachable (offline run), or the local branch has diverged from origin (so a fast-forward pull is impossible), the auto-update step is skipped — silently for the offline case, with a brief `[auto-update]` console message for the divergence and missing-tooling cases. The script always continues with the locally available code.
+  - **FR-39.3.** Pass `-NoUpdate` on the command line to skip the auto-update for a single invocation (e.g. when developing locally on a topic branch).
+
 ## 5. Non-Functional Requirements
 
 - **NFR-1.** **Platform**: Windows 11. **Windows PowerShell 5.1 is the baseline target** — the script must run on a stock Windows 11 install with no additional PowerShell installation. The script must also run unchanged on **PowerShell 7+** (`pwsh`). This rules out PS 7-only constructs (e.g. `ForEach-Object -Parallel`, ternary operator, null-coalescing) in favor of constructs supported by both versions (e.g. async tasks, runspace pools).

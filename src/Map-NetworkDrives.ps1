@@ -26,6 +26,13 @@
     Discovery and enumeration are performed and logged, but no drives are
     mapped, no config is written, and no labels are set.
 
+.PARAMETER NoUpdate
+    Consumed by Map-NetworkDrives.cmd to skip the auto-update (git fetch +
+    fast-forward pull) it normally runs before launching this script. Has
+    no effect inside the PowerShell script itself; declared here only so
+    PowerShell does not reject the unknown switch when the launcher passes
+    the user's full argument list through.
+
 .PARAMETER TimeoutMs
     Per-batch TCP 445 probe timeout in milliseconds. Overrides config.
 
@@ -42,6 +49,7 @@ param(
     [switch]$Silent,
     [switch]$Detailed,
     [switch]$DryRun,
+    [switch]$NoUpdate,
     [int]$TimeoutMs = 0,
     [int]$Parallelism = 0
 )

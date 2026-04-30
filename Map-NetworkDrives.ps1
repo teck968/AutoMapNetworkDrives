@@ -647,15 +647,15 @@ function Get-LetterForUnc {
     )
     $existing = $Config.mappings | Where-Object { $_.unc -eq $UNC } | Select-Object -First 1
     if ($existing) {
-        return [pscustomobject]@{ Letter = $existing.letter.ToUpper(); FromConfig = $true; Persistent = [bool]$existing.persistent }
+        return [pscustomobject]@{ Letter = $existing.letter.ToUpper(); FromConfig = $true }
     }
     $reserved = @($Config.mappings | ForEach-Object { $_.letter })
     $letter = Get-NextFreeDriveLetter -Reserved $reserved
     if (-not $letter) { return $null }
-    return [pscustomobject]@{ Letter = $letter; FromConfig = $false; Persistent = $false }
+    return [pscustomobject]@{ Letter = $letter; FromConfig = $false }
 }
 
-# === Mapping + label (FR-16, FR-17, FR-34..FR-38) ===
+# === Mapping + label (FR-16, FR-34..FR-38) ===
 
 function Get-MountPointRegPath {
     param([Parameter(Mandatory)] [string]$UNC)
@@ -687,11 +687,10 @@ function Set-NetworkDriveLabel {
 function New-MappedDrive {
     param(
         [Parameter(Mandatory)] [string]$Letter,
-        [Parameter(Mandatory)] [string]$UNC,
-        [Parameter(Mandatory)] [bool]$Persistent
+        [Parameter(Mandatory)] [string]$UNC
     )
     if ($Script:DryRun) {
-        Write-Log "[dry-run] Would map ${Letter}: -> $UNC (persistent=$Persistent)"
+        Write-Log "[dry-run] Would map ${Letter}: -> $UNC (persistent)"
         return $true
     }
     # Use net.exe rather than New-SmbMapping or raw WNetAddConnection2.
@@ -705,12 +704,12 @@ function New-MappedDrive {
     # uses. Empirically: net.exe creates drives that propagate to the shell.
     # cmd /c …2>&1 captures stderr cleanly under PS 5.1 (where bare 2>&1 on
     # a native exe produces NativeCommandError ErrorRecords that pollute $?).
-    $persistArg = if ($Persistent) { 'yes' } else { 'no' }
-    $cmdLine = 'net.exe use "{0}:" "{1}" /persistent:{2} 2>&1' -f $Letter, $UNC, $persistArg
+    # All mappings are persistent (FR-16) — no caller-controlled toggle.
+    $cmdLine = 'net.exe use "{0}:" "{1}" /persistent:yes 2>&1' -f $Letter, $UNC
     $output  = cmd /c $cmdLine
     $ec      = $LASTEXITCODE
     if ($ec -eq 0) {
-        Write-Log "Mapped ${Letter}: -> $UNC (persistent=$Persistent)"
+        Write-Log "Mapped ${Letter}: -> $UNC (persistent)"
         return $true
     }
     $errCode = 0
@@ -769,10 +768,12 @@ function Add-ConfigMapping {
     param(
         [Parameter(Mandatory)] $Config,
         [Parameter(Mandatory)] [string]$UNC,
-        [Parameter(Mandatory)] [string]$Letter,
-        [Parameter(Mandatory)] [bool]$Persistent
+        [Parameter(Mandatory)] [string]$Letter
     )
-    $entry = [pscustomobject]@{ unc = $UNC; letter = $Letter; persistent = $Persistent }
+    # Persistent flag is no longer recorded — all mappings are persistent (FR-16).
+    # Existing config files containing a `persistent` field are still read
+    # without complaint; the field is simply ignored on the read side too.
+    $entry = [pscustomobject]@{ unc = $UNC; letter = $Letter }
     $list = New-Object System.Collections.Generic.List[object]
     if ($Config.mappings) { foreach ($m in $Config.mappings) { [void]$list.Add($m) } }
     [void]$list.Add($entry)
@@ -996,11 +997,11 @@ try {
             }
             if ($skipShare) { continue }
 
-            $mapped = New-MappedDrive -Letter $letter -UNC $share.UNC -Persistent $assignment.Persistent
+            $mapped = New-MappedDrive -Letter $letter -UNC $share.UNC
             if ($mapped) {
                 Set-NetworkDriveLabel -UNC $share.UNC -ShareName $share.Name -ShortHostName $shortHost
                 if (-not $assignment.FromConfig) {
-                    Add-ConfigMapping -Config $config -UNC $share.UNC -Letter $letter -Persistent $assignment.Persistent
+                    Add-ConfigMapping -Config $config -UNC $share.UNC -Letter $letter
                     Write-Config -Config $config
                     Write-Log "    Auto-learned: ${letter}: -> $($share.UNC) saved to config (FR-14.3)"
                 }

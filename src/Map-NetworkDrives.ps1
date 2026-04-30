@@ -307,7 +307,8 @@ using System.Text;
 
 namespace AutoMapNetworkDrives {
     public static class Cred {
-        const int CRED_TYPE_GENERIC = 1;
+        public const int CRED_TYPE_GENERIC = 1;
+        public const int CRED_TYPE_DOMAIN_PASSWORD = 2;
         const int CRED_PERSIST_LOCAL_MACHINE = 2;
         const int ERROR_NOT_FOUND = 1168;
 
@@ -360,6 +361,15 @@ namespace AutoMapNetworkDrives {
         }
 
         public static void Write(string target, string user, string secret) {
+            Write(target, user, secret, CRED_TYPE_GENERIC);
+        }
+
+        // Overload that accepts a credential type (CRED_TYPE_GENERIC or
+        // CRED_TYPE_DOMAIN_PASSWORD). Domain Password credentials, keyed under
+        // the bare server name, are what Windows looks for during persistent-
+        // mapping reconnect at logon — without them, persistent SMB mappings
+        // to credential-required hosts come back disconnected after reboot.
+        public static void Write(string target, string user, string secret, int credType) {
             byte[] secretBytes = Encoding.Unicode.GetBytes(secret ?? "");
             IntPtr blobPtr = Marshal.AllocCoTaskMem(secretBytes.Length);
             try {
@@ -368,7 +378,7 @@ namespace AutoMapNetworkDrives {
                 }
                 var cred = new CREDENTIAL {
                     Flags = 0,
-                    Type = CRED_TYPE_GENERIC,
+                    Type = credType,
                     TargetName = target,
                     Comment = null,
                     CredentialBlobSize = secretBytes.Length,
@@ -386,7 +396,11 @@ namespace AutoMapNetworkDrives {
         }
 
         public static bool Delete(string target) {
-            if (CredDelete(target, CRED_TYPE_GENERIC, 0)) return true;
+            return Delete(target, CRED_TYPE_GENERIC);
+        }
+
+        public static bool Delete(string target, int credType) {
+            if (CredDelete(target, credType, 0)) return true;
             int err = Marshal.GetLastWin32Error();
             if (err == ERROR_NOT_FOUND) return false;
             throw new System.ComponentModel.Win32Exception(err);
@@ -429,8 +443,37 @@ function Save-StoredCredential {
     }
     $target = Get-CredTargetName -HostName $HostName
     $plain  = $Credential.GetNetworkCredential().Password
-    [AutoMapNetworkDrives.Cred]::Write($target, $Credential.UserName, $plain)
+    [AutoMapNetworkDrives.Cred]::Write($target, $Credential.UserName, $plain, [AutoMapNetworkDrives.Cred]::CRED_TYPE_GENERIC)
     Write-Log "Stored credential in Credential Manager for $HostName"
+}
+
+function Register-AutoReconnectCredential {
+    # Writes a Domain Password credential (CRED_TYPE_DOMAIN_PASSWORD = 2) keyed
+    # under the bare host name. This is the credential format Windows looks for
+    # when reconnecting persistent SMB mappings at logon. Without it, persistent
+    # mappings to auth-required hosts come back as disconnected ghosts after a
+    # reboot/sign-out, and clicking the drive in Explorer fails with Win32 85
+    # "The local device name is already in use."
+    #
+    # The credential we write under "AutoMapNetworkDrives:<host>" (Generic) is
+    # for our OWN reuse on the next script run; this Domain Password copy is
+    # for Windows. Both encrypted at rest by DPAPI; neither written to disk
+    # by us in plain text.
+    param(
+        [Parameter(Mandatory)] [string]$HostName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+    if ($Script:DryRun) {
+        Write-Log "[dry-run] Would register Windows auto-reconnect credential for $HostName"
+        return
+    }
+    $plain = $Credential.GetNetworkCredential().Password
+    try {
+        [AutoMapNetworkDrives.Cred]::Write($HostName, $Credential.UserName, $plain, [AutoMapNetworkDrives.Cred]::CRED_TYPE_DOMAIN_PASSWORD)
+        Write-Log "Registered Windows auto-reconnect credential for $HostName"
+    } catch {
+        Write-Log "Could not register auto-reconnect credential for ${HostName}: $($_.Exception.Message)" -Level WARN
+    }
 }
 
 # === Authenticated SMB session (FR-12.1) ===
@@ -928,6 +971,10 @@ try {
                 Write-Log "  Using stored credentials for $target"
                 $auth = Connect-AuthenticatedSmbSession -HostName $target -Credential $stored
                 if ($auth.Success) {
+                    # Re-register the Windows-format credential each run. Cheap;
+                    # heals environments where a prior script version stored
+                    # only the Generic copy. CredWrite is idempotent.
+                    Register-AutoReconnectCredential -HostName $target -Credential $stored
                     $enumResult = Get-RemoteSharesViaWNet -ServerName $target
                 } else {
                     Write-Status ("  Stored credentials rejected for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
@@ -993,6 +1040,7 @@ try {
             }
 
             Save-StoredCredential -HostName $target -Credential $cred
+            Register-AutoReconnectCredential -HostName $target -Credential $cred
 
             $enumResult = Get-RemoteSharesViaWNet -ServerName $target
             if (-not $enumResult.Success) {

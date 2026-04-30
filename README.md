@@ -58,7 +58,8 @@ The script is idempotent: shares already mapped to the correct letter are left a
 | `docs/REQUIREMENTS.md` | Full functional and non-functional requirements. |
 | `%APPDATA%\AutoMapNetworkDrives\config.json` | Auto-learned drive-letter assignments and scan settings. Edit by hand to pin a specific letter for a UNC. |
 | `%LOCALAPPDATA%\AutoMapNetworkDrives\logs\map.log` | Run log. Rotates at 5 MB; 3 backups kept. Credentials are never logged. |
-| Credential Manager — Generic, target `AutoMapNetworkDrives:<host>` | Stored credentials. List with `cmdkey /list:AutoMapNetworkDrives*`. |
+| Credential Manager — Generic, target `AutoMapNetworkDrives:<host>` | Stored credentials for the script's own re-use across runs. List with `cmdkey /list:AutoMapNetworkDrives*`. |
+| Credential Manager — Domain Password, target `<host>` | Same credentials, in the format Windows uses to reconnect persistent SMB mappings at logon. Without these, drives come back as disconnected ghosts after a reboot. The script writes both entries when it handles a host's credentials. |
 
 ## Full requirements
 

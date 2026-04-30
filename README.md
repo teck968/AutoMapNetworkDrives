@@ -66,6 +66,26 @@ When you launch via `Map-NetworkDrives.cmd` and the folder is a git clone of thi
 | Credential Manager — Generic, target `AutoMapNetworkDrives:<host>` | Stored credentials for the script's own re-use across runs. List with `cmdkey /list:AutoMapNetworkDrives*`. |
 | Credential Manager — Domain Password, target `<host>` | Same credentials, in the format Windows uses to reconnect persistent SMB mappings at logon. Without these, drives come back as disconnected ghosts after a reboot. The script writes both entries when it handles a host's credentials. |
 
+## Dev notes
+
+Useful commands while developing or testing — these only affect the **current logon session's elevation tier** (run from a non-elevated cmd to clear the drives that show up in your normal Explorer; rebooting clears everything regardless).
+
+**Delete every mapped network drive**
+
+```
+net use * /delete /y
+```
+
+`*` matches all current SMB connections (drive letters and `IPC$` sessions); `/y` skips the confirmation prompt.
+
+**Delete a single mapped network drive**
+
+```
+net use Z: /delete /y
+```
+
+Replace `Z:` with the letter you want to remove. PowerShell equivalent: `Remove-SmbMapping -LocalPath 'Z:' -Force -UpdateProfile`.
+
 ## Full requirements
 
 For the complete functional and non-functional specification, see [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).

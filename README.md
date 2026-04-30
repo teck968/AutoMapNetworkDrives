@@ -44,7 +44,8 @@ The script is idempotent: shares already mapped to the correct letter are left a
 | Flag | Purpose |
 |---|---|
 | `-DryRun` | Discover and enumerate, but do not map drives, write config, or set labels. |
-| `-Silent` | Suppress console output and skip credential prompts. Hosts without stored creds are logged and skipped. Intended for batch / scripted re-runs. |
+| `-Detailed` | Mirror the full log stream to the console (timestamped lines, every entry — same content as the log file). Without this flag, the console shows only the end-user-relevant lines: host headers, drive map results, warnings, errors, and a closing summary. |
+| `-Silent` | Suppress all console output and skip credential prompts. Hosts without stored creds are logged and skipped. Intended for batch / scripted re-runs. Takes precedence over `-Detailed` if both are passed. |
 | `-TimeoutMs N` | Override the per-batch TCP 445 probe timeout (milliseconds). |
 | `-Parallelism N` | Override the number of concurrent TCP probes per batch. |
 

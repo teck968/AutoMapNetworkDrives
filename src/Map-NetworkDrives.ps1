@@ -13,7 +13,14 @@
     Compatible with Windows PowerShell 5.1 and PowerShell 7+ (NFR-1).
 
 .PARAMETER Silent
-    Suppresses console output and disables interactive credential prompts.
+    Suppresses ALL console output and disables interactive credential prompts.
+    Log file is still written. Intended for batch / scripted re-runs.
+
+.PARAMETER Detailed
+    Show every log entry on the console with the full timestamp+level prefix
+    (the same lines written to the log file). Useful for debugging. Without
+    this flag, the console shows a concise end-user-oriented stream — host
+    headers, drive map results, warnings, errors, and a summary.
 
 .PARAMETER DryRun
     Discovery and enumeration are performed and logged, but no drives are
@@ -33,6 +40,7 @@
 [CmdletBinding()]
 param(
     [switch]$Silent,
+    [switch]$Detailed,
     [switch]$DryRun,
     [int]$TimeoutMs = 0,
     [int]$Parallelism = 0
@@ -67,26 +75,65 @@ function Invoke-LogRotate {
     }
 }
 
-function Write-Log {
-    param(
-        [Parameter(Mandatory)] [string]$Message,
-        [ValidateSet('INFO','WARN','ERROR')] [string]$Level = 'INFO'
-    )
+function Add-LogLine {
+    # Append a fully-formatted line to the log file. Always runs (modulo dry-run
+    # / silent — neither suppresses log writes; both only affect side effects
+    # and console). Console output is handled by the callers Write-Log /
+    # Write-Status, not here.
+    param([string]$Level, [string]$Message)
     if (-not (Test-Path $Script:LogDir)) {
         New-Item -ItemType Directory -Path $Script:LogDir -Force -WhatIf:$false | Out-Null
     }
     Invoke-LogRotate
     $line = "{0} {1,-5} {2}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Add-Content -Path $Script:LogPath -Value $line -Encoding UTF8 -WhatIf:$false
+    return $line
+}
 
-    if (-not $Script:Silent) {
-        $color = switch ($Level) {
-            'WARN'  { 'Yellow' }
-            'ERROR' { 'Red' }
-            default { 'Gray' }
-        }
-        Write-Host $line -ForegroundColor $color
+function Get-LevelColor {
+    param([string]$Level)
+    switch ($Level) {
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red' }
+        default { 'Gray' }
     }
+}
+
+function Write-Log {
+    # Diagnostic / verbose entry. Always written to the log file. On the console,
+    # shown only when -Detailed is set (or for ERROR-level entries — those are
+    # always surfaced so users see real failures even in default mode).
+    param(
+        [Parameter(Mandatory)] [string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')] [string]$Level = 'INFO'
+    )
+    $logLine = Add-LogLine -Level $Level -Message $Message
+    if ($Script:Silent) { return }
+    if (-not $Script:Detailed -and $Level -ne 'ERROR') { return }
+    Write-Host $logLine -ForegroundColor (Get-LevelColor $Level)
+}
+
+function Write-Status {
+    # End-user-facing entry. Always written to the log file AND to the console
+    # (unless -Silent). Console formatting depends on -Detailed:
+    #   default  → just the message (color-coded by level), clean for end users
+    #   detailed → full timestamp+level prefix, matches the log file
+    param(
+        [Parameter(Mandatory)] [string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')] [string]$Level = 'INFO'
+    )
+    $logLine = Add-LogLine -Level $Level -Message $Message
+    if ($Script:Silent) { return }
+    $consoleText = if ($Script:Detailed) { $logLine } else { $Message }
+    Write-Host $consoleText -ForegroundColor (Get-LevelColor $Level)
+}
+
+function Write-StatusBreak {
+    # Blank line separator for the default (concise) console mode. Skipped in
+    # detailed mode (where every line carries a timestamp anyway, so blanks
+    # would just be noise) and in silent mode (no console output at all).
+    if ($Script:Silent -or $Script:Detailed) { return }
+    Write-Host ''
 }
 
 # === Config (FR-24..FR-28) ===
@@ -115,7 +162,7 @@ function Read-Config {
         if (-not $cfg.mappings)  { $cfg | Add-Member -NotePropertyName mappings  -NotePropertyValue @() -Force }
         return $cfg
     } catch {
-        Write-Log "Config at $Script:ConfigPath unreadable, using defaults: $($_.Exception.Message)" -Level WARN
+        Write-Status "Config at $Script:ConfigPath unreadable, using defaults: $($_.Exception.Message)" -Level WARN
         return Get-DefaultConfig
     }
 }
@@ -363,7 +410,7 @@ function Get-StoredCredential {
     try {
         $found = [AutoMapNetworkDrives.Cred]::TryRead($target, [ref]$user, [ref]$secret)
     } catch {
-        Write-Log "Credential read failed for ${HostName}: $($_.Exception.Message)" -Level WARN
+        Write-Status "Credential read failed for ${HostName}: $($_.Exception.Message)" -Level WARN
         return $null
     }
     if (-not $found) { return $null }
@@ -690,7 +737,7 @@ function New-MappedDrive {
         [Parameter(Mandatory)] [string]$UNC
     )
     if ($Script:DryRun) {
-        Write-Log "[dry-run] Would map ${Letter}: -> $UNC (persistent)"
+        Write-Status "[dry-run] Would map ${Letter}: -> $UNC"
         return $true
     }
     # Use net.exe rather than New-SmbMapping or raw WNetAddConnection2.
@@ -709,14 +756,14 @@ function New-MappedDrive {
     $output  = cmd /c $cmdLine
     $ec      = $LASTEXITCODE
     if ($ec -eq 0) {
-        Write-Log "Mapped ${Letter}: -> $UNC (persistent)"
+        Write-Status "Mapped ${Letter}: -> $UNC"
         return $true
     }
     $errCode = 0
     foreach ($line in $output) {
         if ($line -match 'System error (\d+) has occurred') { $errCode = [int]$matches[1]; break }
     }
-    Write-Log ("Failed to map {0}: -> {1} (net.exe exit {2}, Win32 {3}): {4}" -f $Letter, $UNC, $ec, $errCode, ($output -join '; ')) -Level ERROR
+    Write-Status ("Failed to map {0}: -> {1} (net.exe exit {2}, Win32 {3}): {4}" -f $Letter, $UNC, $ec, $errCode, ($output -join '; ')) -Level ERROR
     # Track the failure so subsequent shares don't keep trying the same letter.
     # Get-UsedDriveLetters consults this set on each call.
     if (-not $Script:FailedLetters) {
@@ -787,7 +834,7 @@ function Add-ConfigMapping {
 
 $mutex = New-SingleInstanceMutex
 if (-not $mutex) {
-    Write-Log "Another instance is already running; exiting." -Level WARN
+    Write-Status "Another instance is already running; exiting." -Level WARN
     exit 0
 }
 function Test-IsElevated {
@@ -798,8 +845,15 @@ function Test-IsElevated {
 
 $exitCode = 0
 $Script:FailedLetters = New-Object System.Collections.Generic.HashSet[string]
+$Script:CountMapped    = 0
+$Script:CountUnchanged = 0
+$Script:CountSkipped   = 0
+$Script:CountFailed    = 0
 try {
     Write-Log "AutoMapNetworkDrives starting (mode: $(if ($Script:Silent) {'silent'} else {'manual'}), dryRun: $Script:DryRun)"
+    $startMsg = "Scanning local network..."
+    if ($Script:DryRun) { $startMsg += " (dry-run)" }
+    Write-Status $startMsg
 
     # Warn on elevated execution: Windows UAC keeps drive mappings created in
     # the elevated logon session separate from the user's interactive session,
@@ -807,8 +861,8 @@ try {
     # connections" / EnableLinkedConnections behavior). Strongly suggest
     # re-running non-elevated unless the user has set EnableLinkedConnections.
     if ((Test-IsElevated) -and -not $Script:Silent) {
-        Write-Log "Running ELEVATED - drive mappings created here will live in the admin logon session and will NOT appear in your normal Explorer." -Level WARN
-        Write-Log "  Re-run from a non-elevated PowerShell/cmd window unless you have set HKLM\SYSTEM\CurrentControlSet\Control\Lsa\EnableLinkedConnections=1." -Level WARN
+        Write-Status "Running ELEVATED - drive mappings created here will live in the admin logon session and will NOT appear in your normal Explorer." -Level WARN
+        Write-Status "  Re-run from a non-elevated PowerShell/cmd window unless you have set HKLM\SYSTEM\CurrentControlSet\Control\Lsa\EnableLinkedConnections=1." -Level WARN
     }
 
     $config = Read-Config
@@ -841,9 +895,10 @@ try {
         $resolved = Resolve-RemoteHostName -IP $ip
         $target   = if ($resolved) { $resolved } else { $ip }
         if (-not $resolved) {
-            Write-Log "Host $ip - hostname could not be resolved; UNC will use IP" -Level WARN
+            Write-Status "Host $ip - hostname could not be resolved; UNC will use IP" -Level WARN
         }
-        Write-Log "Host: $target ($ip)"
+        Write-StatusBreak
+        Write-Status "Host: $target ($ip)"
 
         $enumResult = Get-RemoteSharesViaWNet -ServerName $target
 
@@ -875,7 +930,7 @@ try {
                 if ($auth.Success) {
                     $enumResult = Get-RemoteSharesViaWNet -ServerName $target
                 } else {
-                    Write-Log ("  Stored credentials rejected for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
+                    Write-Status ("  Stored credentials rejected for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
                 }
             }
         }
@@ -883,19 +938,21 @@ try {
         if (-not $enumResult.Success) {
             if (Test-AuthError $enumResult.ErrorCode) {
                 if ($Script:Silent) {
-                    Write-Log "  Host $target requires credentials; skipping (silent mode, FR-11.4)" -Level WARN
+                    Write-Status "  Host $target requires credentials; skipping (silent mode)" -Level WARN
+                    $Script:CountSkipped++
                 } else {
                     [void]$needsCreds.Add($target)
                     Write-Log "  Host $target deferred to credential prompt phase"
                 }
             } else {
-                Write-Log ("  Share enumeration failed for {0} (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+                Write-Status ("  Share enumeration failed for {0} (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+                $Script:CountSkipped++
             }
             continue
         }
 
         if ($enumResult.Shares.Count -eq 0) {
-            Write-Log "  No user shares listed on $target"
+            Write-Status "  No user shares listed on $target"
             continue
         }
         $hostShares[$target] = $enumResult.Shares
@@ -904,29 +961,34 @@ try {
     # === Phase 2: batched credential prompt (FR-11.2) — manual mode only ===
 
     if ($Script:DryRun -and -not $Script:Silent -and $needsCreds.Count -gt 0) {
-        Write-Log "[dry-run] $($needsCreds.Count) host(s) would be prompted for credentials:"
-        foreach ($h in $needsCreds) { Write-Log "  - $h" }
+        Write-StatusBreak
+        Write-Status "[dry-run] $($needsCreds.Count) host(s) would be prompted for credentials:"
+        foreach ($h in $needsCreds) { Write-Status "  - $h" }
     }
     elseif (-not $Script:Silent -and -not $Script:DryRun -and $needsCreds.Count -gt 0) {
-        Write-Log "$($needsCreds.Count) host(s) require credentials:"
-        foreach ($h in $needsCreds) { Write-Log "  - $h" }
+        Write-StatusBreak
+        Write-Status "$($needsCreds.Count) host(s) require credentials:"
+        foreach ($h in $needsCreds) { Write-Status "  - $h" }
 
         foreach ($target in $needsCreds) {
             $cred = $null
             try {
                 $cred = Get-Credential -Message "Credentials for \\$target"
             } catch {
-                Write-Log "  Credential prompt failed for ${target}: $($_.Exception.Message)" -Level WARN
+                Write-Status "  Credential prompt failed for ${target}: $($_.Exception.Message)" -Level WARN
+                $Script:CountSkipped++
                 continue
             }
             if (-not $cred) {
-                Write-Log "  No credentials provided for $target; skipping" -Level WARN
+                Write-Status "  No credentials provided for $target; skipping" -Level WARN
+                $Script:CountSkipped++
                 continue
             }
 
             $auth = Connect-AuthenticatedSmbSession -HostName $target -Credential $cred
             if (-not $auth.Success) {
-                Write-Log ("  Authentication failed for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
+                Write-Status ("  Authentication failed for {0} (Win32 {1}): {2}" -f $target, $auth.ErrorCode, $auth.Error) -Level WARN
+                $Script:CountSkipped++
                 continue
             }
 
@@ -934,11 +996,12 @@ try {
 
             $enumResult = Get-RemoteSharesViaWNet -ServerName $target
             if (-not $enumResult.Success) {
-                Write-Log ("  Enumeration still failing post-auth for {0} (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+                Write-Status ("  Enumeration still failing post-auth for {0} (Win32 {1}): {2}" -f $target, $enumResult.ErrorCode, $enumResult.Error) -Level WARN
+                $Script:CountSkipped++
                 continue
             }
             if ($enumResult.Shares.Count -eq 0) {
-                Write-Log "  No user shares listed on $target"
+                Write-Status "  No user shares listed on $target"
                 continue
             }
             $hostShares[$target] = $enumResult.Shares
@@ -956,7 +1019,8 @@ try {
 
             $assignment = Get-LetterForUnc -UNC $share.UNC -Config $config
             if (-not $assignment) {
-                Write-Log "    No drive letters available; skipping $($share.UNC)" -Level WARN
+                Write-Status "    No drive letters available; skipping $($share.UNC)" -Level WARN
+                $Script:CountSkipped++
                 continue
             }
             $letter = $assignment.Letter
@@ -970,6 +1034,7 @@ try {
                 'NoOp' {
                     Write-Log "    ${letter}: already mapped to $($share.UNC); no-op (FR-18)"
                     Set-NetworkDriveLabel -UNC $share.UNC -ShareName $share.Name -ShortHostName $shortHost
+                    $Script:CountUnchanged++
                     $skipShare = $true
                 }
                 'Ghost' {
@@ -978,17 +1043,19 @@ try {
                     # Fall through (do not set $skipShare) so the mapping below recreates it.
                 }
                 'AlreadyElsewhere' {
-                    Write-Log "    $($share.UNC) already mapped under a different letter; leaving as-is (FR-21)"
+                    Write-Status "    $($share.UNC) already mapped under a different letter; leaving as-is"
+                    $Script:CountUnchanged++
                     $skipShare = $true
                 }
                 'LetterTaken' {
                     if ($assignment.FromConfig) {
-                        Write-Log "    Configured letter ${letter}: is taken; trying next free letter (FR-19/20)" -Level WARN
+                        Write-Status "    Configured letter ${letter}: is taken; trying next free letter" -Level WARN
                     }
                     $reserved = @($config.mappings | ForEach-Object { $_.letter })
                     $newLetter = Get-NextFreeDriveLetter -Reserved $reserved
                     if (-not $newLetter) {
-                        Write-Log "    No drive letters available after collision; skipping $($share.UNC)" -Level WARN
+                        Write-Status "    No drive letters available after collision; skipping $($share.UNC)" -Level WARN
+                        $Script:CountSkipped++
                         $skipShare = $true
                     } else {
                         $letter = $newLetter
@@ -1003,12 +1070,20 @@ try {
                 if (-not $assignment.FromConfig) {
                     Add-ConfigMapping -Config $config -UNC $share.UNC -Letter $letter
                     Write-Config -Config $config
-                    Write-Log "    Auto-learned: ${letter}: -> $($share.UNC) saved to config (FR-14.3)"
+                    Write-Log "    Auto-learned: ${letter}: -> $($share.UNC) saved to config"
                 }
+                $Script:CountMapped++
+            } else {
+                $Script:CountFailed++
             }
         }
     }
 
+    Write-StatusBreak
+    $summary = "Done. {0} mapped, {1} unchanged, {2} skipped, {3} failed." -f `
+        $Script:CountMapped, $Script:CountUnchanged, $Script:CountSkipped, $Script:CountFailed
+    if ($Script:DryRun) { $summary += "  (dry-run: no changes were made)" }
+    Write-Status $summary
     Write-Log "AutoMapNetworkDrives complete"
 }
 catch {

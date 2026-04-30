@@ -137,9 +137,10 @@ A PowerShell script that, when run manually on a Windows 11 workgroup machine, d
 
 ### 4.10 Output & Logging
 
-- **FR-29.** Runs print progress lines to the console by default (subnet being scanned, hosts found, shares being mapped, conflicts skipped, errors).
-- **FR-30.** When invoked with `-Silent`, the script suppresses console output (only writes to the log file). Intended for batch / scripted re-runs.
-- **FR-31.** All runs write to a log file at `%LOCALAPPDATA%\AutoMapNetworkDrives\logs\map.log`.
+- **FR-29.** Default console output is end-user oriented: a one-line start banner, a header line per host found, one line per share mapped/skipped/failed, warnings and errors, and a closing summary of the form `Done. N mapped, M unchanged, K skipped, L failed.` (with a `(dry-run: no changes were made)` suffix when `-DryRun` is set). Diagnostic detail (subnet/scan parameters, share-enumeration internals, idempotent no-op explanations, label-set confirmations, FR cross-references) is suppressed from the console but always recorded to the log file.
+  - **FR-29.1.** When invoked with `-Detailed`, the console mirrors the log file verbatim — every entry, with the full `<timestamp> <LEVEL> <message>` prefix. Intended for debugging.
+- **FR-30.** When invoked with `-Silent`, the script suppresses ALL console output (only writes to the log file). Intended for batch / scripted re-runs. `-Silent` takes precedence over `-Detailed` if both are passed.
+- **FR-31.** All runs write to a log file at `%LOCALAPPDATA%\AutoMapNetworkDrives\logs\map.log`. The log file contents are independent of `-Silent` / `-Detailed` (always full detail).
 - **FR-32.** Log rotation:
   - Single rolling file (`map.log`).
   - Rotate at **5 MB**; rename existing `map.log` to `map.log.1`, shift `.1` → `.2`, etc.

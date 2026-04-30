@@ -40,6 +40,7 @@ if errorlevel 1 (
     REM Origin unreachable or no upstream configured — silent skip (offline run).
     goto :eof
 )
+for /f "delims=" %%H in ('git rev-parse HEAD 2^>nul') do set "AU_BEFORE=%%H"
 git pull --ff-only --quiet 2>nul
 if errorlevel 1 (
     echo [auto-update] Local branch has diverged from origin; skipping.
@@ -47,6 +48,8 @@ if errorlevel 1 (
     echo                'git reset --hard origin/main' to discard local changes.
     goto :eof
 )
+for /f "delims=" %%H in ('git rev-parse HEAD 2^>nul') do set "AU_AFTER=%%H"
+if not "%AU_BEFORE%"=="%AU_AFTER%" echo [auto-update] Updated to %AU_AFTER:~0,7%.
 goto :eof
 
 :InstallGit

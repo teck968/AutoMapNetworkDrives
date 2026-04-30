@@ -1,0 +1,8 @@
+# Force CRLF on checkout for Windows batch files. Without this, the
+# line endings depend on each user's local core.autocrlf setting:
+# autocrlf=true gives CRLF (works), but autocrlf=input or =false leaves
+# LF on checkout, which breaks cmd.exe — the parser mis-tokenizes lines
+# at LF boundaries (e.g. 'errorlevel' becomes 'rlevel', 'git rev-parse'
+# becomes 'parse') because cmd expects CR+LF as the line terminator.
+*.cmd text eol=crlf
+*.bat text eol=crlf

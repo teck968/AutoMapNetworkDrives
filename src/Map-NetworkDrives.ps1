@@ -502,6 +502,24 @@ function Save-StoredCredential {
     [void](Confirm-WrittenCredential -Target $target -CredType ([AutoMapNetworkDrives.Cred]::CRED_TYPE_GENERIC) -ExpectedUser $Credential.UserName)
 }
 
+function Test-AutoReconnectCredentialExists {
+    # Returns $true if a CRED_TYPE_DOMAIN_PASSWORD credential exists in
+    # Credential Manager keyed by the bare host name (the entry Windows
+    # consults when reconnecting persistent SMB mappings at logon). Used in
+    # Phase 1 to detect hosts whose enum succeeded silently (e.g., via
+    # workgroup pass-through or LSA cache) and so never went through our
+    # explicit credential-handling path — those hosts will fail to reconnect
+    # cleanly across a sign-out if the silent auth was an LSA cache hit.
+    param([Parameter(Mandatory)] [string]$HostName)
+    $u = $null
+    $s = $null
+    try {
+        return [AutoMapNetworkDrives.Cred]::TryRead($HostName, [AutoMapNetworkDrives.Cred]::CRED_TYPE_DOMAIN_PASSWORD, [ref]$u, [ref]$s)
+    } catch {
+        return $false
+    }
+}
+
 function Register-AutoReconnectCredential {
     # Writes a Domain Password credential (CRED_TYPE_DOMAIN_PASSWORD = 2) keyed
     # under the bare host name. This is the credential format Windows looks for
@@ -1063,6 +1081,22 @@ try {
             Write-Status "  No user shares listed on $target"
             continue
         }
+
+        # Detect-and-prompt for hosts whose enum succeeded silently (workgroup
+        # pass-through or LSA credential cache) without us authenticating
+        # explicitly: if no Domain Password credential exists for the host,
+        # defer to Phase 2 to capture credentials. Without this, a successful
+        # silent enum that relied on the LSA cache (rather than pass-through)
+        # would map drives that come back as disconnected ghosts after the
+        # next reboot — the cache evicts at sign-out but no Credential Manager
+        # entry exists for Windows to fall back to. -Silent skips the deferral
+        # since Phase 2 won't run.
+        if (-not $Script:Silent -and -not (Test-AutoReconnectCredentialExists -HostName $target)) {
+            Write-Log "  Host $target enum succeeded but no auto-reconnect credential is stored; deferring to credential prompt phase for cross-reboot reliability"
+            [void]$needsCreds.Add($target)
+            continue
+        }
+
         $hostShares[$target] = $enumResult.Shares
     }
 

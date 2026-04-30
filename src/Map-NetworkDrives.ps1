@@ -982,13 +982,18 @@ try {
     $hostShares = New-Object 'System.Collections.Generic.Dictionary[string, object]'
     $needsCreds = New-Object System.Collections.Generic.List[string]
 
+    # Single visual separator before the host list — not between every pair.
+    # In default mode the host list is the bulk of the output and per-host
+    # blanks just bloat it; warnings or per-share map results that follow a
+    # given host header still attach visibly to it through indentation.
+    if ($liveIPs.Count -gt 0) { Write-StatusBreak }
+
     foreach ($ip in $liveIPs) {
         $resolved = Resolve-RemoteHostName -IP $ip
         $target   = if ($resolved) { $resolved } else { $ip }
         if (-not $resolved) {
             Write-Status "Host $ip - hostname could not be resolved; UNC will use IP" -Level WARN
         }
-        Write-StatusBreak
         Write-Status "Host: $target ($ip)"
 
         $enumResult = Get-RemoteSharesViaWNet -ServerName $target

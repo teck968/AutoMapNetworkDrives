@@ -29,10 +29,17 @@ goto :eof
 
 :TryUpdate
 where git >nul 2>&1
-if errorlevel 1 call :InstallGit
+if errorlevel 1 (
+    set "AU_INSTALLED_GIT="
+    call :InstallGit
+)
 where git >nul 2>&1
 if errorlevel 1 (
-    echo [auto-update] git not available; skipping.
+    if defined AU_INSTALLED_GIT (
+        echo [auto-update] Git was installed but isn't visible to this session yet. Re-run the launcher to pick up the update.
+    ) else (
+        echo [auto-update] git not available; skipping.
+    )
     goto :eof
 )
 git fetch --quiet origin 2>nul
@@ -60,4 +67,16 @@ if errorlevel 1 (
 )
 echo [auto-update] Installing Git via winget (one-time setup)...
 winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements
+if errorlevel 1 (
+    echo [auto-update] winget install failed (exit %errorlevel%); skipping.
+    goto :eof
+)
+set "AU_INSTALLED_GIT=1"
+REM winget updates the system PATH, but our running cmd session inherited
+REM PATH at start and won't see the change. Prepend Git for Windows's
+REM standard install locations so the next 'where git' check in this
+REM session can find the freshly installed binary.
+if exist "%ProgramFiles%\Git\cmd\git.exe"          set "PATH=%ProgramFiles%\Git\cmd;%PATH%"
+if exist "%ProgramFiles(x86)%\Git\cmd\git.exe"     set "PATH=%ProgramFiles(x86)%\Git\cmd;%PATH%"
+if exist "%LocalAppData%\Programs\Git\cmd\git.exe" set "PATH=%LocalAppData%\Programs\Git\cmd;%PATH%"
 goto :eof

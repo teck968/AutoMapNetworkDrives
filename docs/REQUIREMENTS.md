@@ -193,3 +193,4 @@ The following are intentionally out of scope for v1 and may be revisited:
 - **Workgroup**: Windows networking model with no central directory; each host authenticates clients independently.
 - **Persistent mapping**: a drive mapping that Windows recreates at user logon, independent of any script. *(All mappings created by this script are persistent per FR-16.)*
 - **Credential Manager**: built-in Windows credential vault (`cmdkey.exe`, `Get-StoredCredential`).
+

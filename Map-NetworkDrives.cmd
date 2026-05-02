@@ -18,6 +18,18 @@ for %%A in (%*) do if /i "%%~A"=="-NoUpdate" set "NO_UPDATE=1"
 
 if not defined NO_UPDATE if exist ".git\HEAD" call :TryUpdate
 
+REM If TryUpdate pulled an update to this .cmd, re-launch ourselves with the
+REM new content so the rest of execution doesn't depend on cmd.exe's behavior
+REM around mid-execution file changes (cmd re-reads the script at certain
+REM control-flow boundaries; safer to start fresh). Run #2 inherits the same
+REM console window via cmd /c, so all output stays in chronological order in
+REM one place. -NoUpdate prevents an infinite loop and skips the redundant
+REM second fetch.
+if defined AU_RELAUNCH (
+    cmd /c "%~f0" %* -NoUpdate
+    exit /b
+)
+
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Map-NetworkDrives.ps1" %*
 
 REM Pause only when double-clicked from Explorer (so output stays visible);
@@ -56,7 +68,11 @@ if errorlevel 1 (
     goto :eof
 )
 for /f "delims=" %%H in ('git rev-parse HEAD 2^>nul') do set "AU_AFTER=%%H"
-if not "%AU_BEFORE%"=="%AU_AFTER%" echo [auto-update] Updated to %AU_AFTER:~0,7%.
+if not "%AU_BEFORE%"=="%AU_AFTER%" (
+    echo [auto-update] Updated to %AU_AFTER:~0,7%.
+    echo [auto-update] Re-launching with the new version...
+    set "AU_RELAUNCH=1"
+)
 goto :eof
 
 :InstallGit

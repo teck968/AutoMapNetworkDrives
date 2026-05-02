@@ -13,6 +13,16 @@ REM first use if git is missing and winget is available.
 setlocal
 cd /d "%~dp0"
 
+REM Clear any auto-update bookkeeping that may have been inherited from a
+REM parent process (e.g., when this run was spawned by an earlier instance's
+REM relaunch logic). Without this, AU_RELAUNCH=1 from the parent would make
+REM this child also try to relaunch, causing infinite cmd.exe recursion
+REM ("Maximum setlocal recursion level reached.").
+set "AU_RELAUNCH="
+set "AU_BEFORE="
+set "AU_AFTER="
+set "AU_INSTALLED_GIT="
+
 set "NO_UPDATE="
 for %%A in (%*) do if /i "%%~A"=="-NoUpdate" set "NO_UPDATE=1"
 

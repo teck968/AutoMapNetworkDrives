@@ -34,7 +34,14 @@ REM line ifs expand at execute time and behave reliably.
 if defined AU_RELAUNCH goto :Relaunch
 goto :SkipRelaunch
 :Relaunch
-cmd /c ""%~f0" %* -NoUpdate"
+REM Invoke the .cmd via its path. Windows' .cmd handler spawns a fresh
+REM cmd.exe to interpret the file, giving us a clean parser state — this
+REM is what we want to sidestep cmd's mid-execution file re-read behavior.
+REM Plain "%~f0" %* args avoids cmd /c's quote-stripping rules entirely
+REM (the earlier "cmd /c ""%~f0" %* -NoUpdate"" form produced "input
+REM line too long." / "syntax incorrect." errors when invoked from a
+REM child cmd, despite the same form working when invoked directly).
+"%~f0" %* -NoUpdate
 exit /b
 :SkipRelaunch
 

@@ -8,7 +8,7 @@
       * Manual (default): writes to log AND echoes to console; in this mode
         the user is prompted for credentials when needed (FR-11.1..11.3).
       * Silent (-Silent): writes only to log; skips any host without stored
-        credentials (FR-11.4). Intended for the at-login Task Scheduler entry.
+        credentials (FR-11.4). Intended for batch / scripted re-runs.
 
     Compatible with Windows PowerShell 5.1 and PowerShell 7+ (NFR-1).
 

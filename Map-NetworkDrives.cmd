@@ -25,10 +25,18 @@ REM control-flow boundaries; safer to start fresh). Run #2 inherits the same
 REM console window via cmd /c, so all output stays in chronological order in
 REM one place. -NoUpdate prevents an infinite loop and skips the redundant
 REM second fetch.
-if defined AU_RELAUNCH (
-    cmd /c "%~f0" %* -NoUpdate
-    exit /b
-)
+REM
+REM Use single-line `if defined` instead of an `if (...)` parens block:
+REM inside a parens block, %~f0 and %* are parse-time expanded along with
+REM the rest of the block, which has caused "The input line is too long."
+REM / "The syntax of the command is incorrect." errors in practice. Single-
+REM line ifs expand at execute time and behave reliably.
+if defined AU_RELAUNCH goto :Relaunch
+goto :SkipRelaunch
+:Relaunch
+cmd /c ""%~f0" %* -NoUpdate"
+exit /b
+:SkipRelaunch
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0src\Map-NetworkDrives.ps1" %*
 
